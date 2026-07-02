@@ -7,11 +7,14 @@ yt-dlp ^
   --download-archive archive.log ^
   --retries 20 ^
   --fragment-retries 20 ^
+  --extractor-retries 20 ^
   --retry-sleep http:exp=30:900 ^
   --retry-sleep fragment:exp=30:900 ^
+  --retry-sleep extractor:exp=30:900 ^
   --sleep-requests 5 ^
-  --sleep-interval 60 ^
-  --max-sleep-interval 180 ^
+  --sleep-interval 30 ^
+  --max-sleep-interval 60 ^
+  --match-filter "title!='web.archive-youtube video #%%(id)s'" ^
   --concurrent-fragments 1 ^
   --add-metadata ^
   --parse-metadata "%%(title)s:%%(meta_title)s" ^
@@ -23,4 +26,4 @@ yt-dlp ^
   --convert-thumbnails png ^
   --output "%%(title)s - %%(uploader)s - %%(upload_date)s/%%(title)s - %%(uploader)s - %%(upload_date)s [%%(id)s].%%(ext)s" ^
   --merge-output-format mp4 ^
-  --batch-file "Source.txt" 2^>^&1 | tee log.txt
+  --batch-file "Source.txt" 2>&1 | tee log.txt
