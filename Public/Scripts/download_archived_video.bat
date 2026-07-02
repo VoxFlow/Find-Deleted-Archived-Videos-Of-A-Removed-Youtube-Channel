@@ -1,0 +1,26 @@
+yt-dlp ^
+  --verbose ^
+  --force-ipv4 ^
+  --ignore-errors ^
+  --no-continue ^
+  --no-overwrites ^
+  --download-archive archive.log ^
+  --retries 20 ^
+  --fragment-retries 20 ^
+  --retry-sleep http:exp=30:900 ^
+  --retry-sleep fragment:exp=30:900 ^
+  --sleep-requests 5 ^
+  --sleep-interval 60 ^
+  --max-sleep-interval 180 ^
+  --concurrent-fragments 1 ^
+  --add-metadata ^
+  --parse-metadata "%%(title)s:%%(meta_title)s" ^
+  --parse-metadata "%%(uploader)s:%%(meta_artist)s" ^
+  --write-description ^
+  --write-info-json ^
+  --write-thumbnail ^
+  --embed-thumbnail ^
+  --convert-thumbnails png ^
+  --output "%%(title)s - %%(uploader)s - %%(upload_date)s/%%(title)s - %%(uploader)s - %%(upload_date)s [%%(id)s].%%(ext)s" ^
+  --merge-output-format mp4 ^
+  --batch-file "Source.txt" 2^>^&1 | tee log.txt
