@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Filmot Channel XLSX Exporter + 2oe + Archived Thumbnails
 // @namespace    filmot-channel-xlsx-2oe-archived-thumbs
-// @version      1.2.15
+// @version      1.2.16
 // @description  Export Filmot channel metadata to XLSX with cached 2oe checks, optional archived thumbnail embedding, persistent selection, and adaptive throttling.
 // @match        https://filmot.com/channel/*
 // @grant        GM_xmlhttpRequest
@@ -23,7 +23,7 @@
   }
   window[BOOT_GUARD] = true;
 
-  const SCRIPT_VERSION = '1.2.15';
+  const SCRIPT_VERSION = '1.2.16';
   const CACHE_SCHEMA_VERSION = 2;
   const APP = 'filmot_channel_xlsx_exporter_v1';
   const WB_2OE = 'https://web.archive.org/web/2oe_/http://wayback-fakeurl.archive.org/yt/';
@@ -1133,8 +1133,8 @@
     if (mode === 'any') return true;
     const n = twoOeStatusNumber(row);
     if (mode === 'redirect3xx') return Number.isFinite(n) && n >= 300 && n < 400;
-    if (mode === 'noarchive4xx') return Number.isFinite(n) && n >= 400 && n < 500;
-    if (mode === 'retry') return !Number.isFinite(n) || n === -1 || n >= 500 || /retry|error|timeout/i.test(String(row?.twoOeStatus || '') + ' ' + String(row?.notes || ''));
+    if (mode === 'noarchive4xx') return Number.isFinite(n) && n >= 400 && n < 500 && n !== 429;
+    if (mode === 'retry') return !Number.isFinite(n) || n === -1 || n === 429 || n >= 500 || /retry|error|timeout/i.test(String(row?.twoOeStatus || '') + ' ' + String(row?.notes || ''));
     return true;
   }
 
@@ -1237,7 +1237,7 @@
         row.notes = appendNote(row.notes, `live hq retry/unknown HTTP ${http}`);
         state.throttleLive.fail();
         cache[row.videoId] = { status: 'retry', httpStatus: http, source: `live-hq-${http}`, checkedAt: Date.now(), url };
-        logLink('LIVE', `${row.videoId}: HTTP ${http} -> unknown/retry`, url);
+        logLink('LIVE', `${row.videoId}: HTTP ${http}${http === 429 ? ' rate-limited' : ''} -> unknown/retry`, url);
       }
 
       state.rows.set(row.videoId, row);
@@ -1316,19 +1316,19 @@
 
   function twoOeIsTransientStatus(status) {
     const n = parseInt(String(status ?? '').trim(), 10);
-    return n === -1 || n >= 500;
+    return n === -1 || n === 429 || n >= 500;
   }
 
   function twoOeIsFinalStatus(status) {
     const n = parseInt(String(status ?? '').trim(), 10);
-    return Number.isFinite(n) && n !== -1 && n < 500;
+    return Number.isFinite(n) && n !== -1 && n !== 429 && n < 500;
   }
 
   function twoOeCategoryForStatus(status) {
     const n = parseInt(String(status ?? '').trim(), 10);
     if (n >= 300 && n < 400) return 'redirect3xx';
-    if (n >= 400 && n < 500) return 'no_archive';
-    if (n === -1 || n >= 500) return 'retry_needed';
+    if (n >= 400 && n < 500 && n !== 429) return 'no_archive';
+    if (n === -1 || n === 429 || n >= 500) return 'retry_needed';
     return 'unknown';
   }
 
@@ -1352,7 +1352,7 @@
     if (res.ok) {
       status = res.response.status || -1;
       finalUrl = res.response.finalUrl || '';
-      if (finalUrl && finalUrl !== url && status >= 200 && status < 500) status = 302;
+      if (finalUrl && finalUrl !== url && status >= 200 && status < 500 && status !== 429) status = 302;
     }
     return { status, finalUrl };
   }
@@ -1533,7 +1533,7 @@
       await persistRowAndCache(row, false);
 
       const nextAction = round < TWO_OE_MAX_ATTEMPTS ? `queued for retry round ${round + 1}` : 'max rounds exhausted';
-      log(`[2oe transient] ${row.videoId} round ${round}/${TWO_OE_MAX_ATTEMPTS}: ${status} | level ${levelBefore}->${levelAfter}/${state.throttle2oe.maxLevel} | action=${nextAction}`);
+      log(`[2oe transient] ${row.videoId} round ${round}/${TWO_OE_MAX_ATTEMPTS}: ${status}${status === 429 ? ' rate-limited' : ''} | level ${levelBefore}->${levelAfter}/${state.throttle2oe.maxLevel} | action=${nextAction}`);
       return { item, final: false, transient: true, status };
     }
 
@@ -1786,11 +1786,11 @@
     }
 
     const http = res.response.status;
-    if (http >= 500) {
+    if (http === 429 || http >= 500) {
       state.throttleCdx.fail();
-      cache[key] = { status: 'retry', captures: [], bestCapture: null, checkedAt: Date.now(), error: `HTTP ${http}` };
+      cache[key] = { status: 'retry', captures: [], bestCapture: null, checkedAt: Date.now(), error: `HTTP ${http}${http === 429 ? ' rate-limited' : ''}` };
       saveCdxCache(cache);
-      log(`[CDX RETRY] ${domain} ${videoId}: HTTP ${http}`);
+      log(`[CDX RETRY] ${domain} ${videoId}: HTTP ${http}${http === 429 ? ' rate-limited' : ''}`);
       return cache[key];
     }
     if (http !== 200) {
@@ -2043,10 +2043,11 @@
       } catch (e) {
         const err = String(e.message || e);
         const replay404 = /image HTTP 404/.test(err);
-        row.notes = appendNote(row.notes, replay404 ? 'thumbnail replay 404 despite CDX candidate' : `thumbnail asset prep failed: ${err}`);
+        const replay429 = /image HTTP 429/.test(err);
+        row.notes = appendNote(row.notes, replay404 ? 'thumbnail replay 404 despite CDX candidate' : replay429 ? 'thumbnail replay HTTP 429 rate-limited' : `thumbnail asset prep failed: ${err}`);
         state.rows.set(row.videoId, row);
         saveRows();
-        row.thumbnailCdxStatus = replay404 ? 'found_but_replay_404' : (row.thumbnailCdxStatus || 'retry');
+        row.thumbnailCdxStatus = replay404 ? 'found_but_replay_404' : replay429 ? 'retry_429' : (row.thumbnailCdxStatus || 'retry');
         row.thumbnailSource = row.thumbnailSource || 'none';
         state.rows.set(row.videoId, row);
         saveRows();
@@ -2054,14 +2055,14 @@
           status: replay404 ? 'broken_replay_404' : 'retry',
           url: row.archivedThumbnailUrl || '',
           source: row.thumbnailSource || 'none',
-          cdxStatus: row.thumbnailCdxStatus || (replay404 ? 'found_but_replay_404' : 'retry'),
+          cdxStatus: row.thumbnailCdxStatus || (replay404 ? 'found_but_replay_404' : replay429 ? 'retry_429' : 'retry'),
           cdxBytes: row.thumbnailBytes || '',
           cdxTimestamp: row.thumbnailTimestamp || '',
           checkedAt: Date.now(),
           error: err
         };
         saveThumbAssetCache(cache);
-        log(`[IMG PREP FAIL] ${row.videoId}: ${err}${replay404 ? ' | found_but_replay_404 (permanent unavailable, not retrying candidates)' : ''}`);
+        log(`[IMG PREP FAIL] ${row.videoId}: ${err}${replay404 ? ' | found_but_replay_404 (permanent unavailable, not retrying candidates)' : replay429 ? ' | retry_needed rate-limited' : ''}`);
       }
 
       updateStats();
@@ -2079,15 +2080,15 @@
     const missingThumb = includeThumb ? rows.filter(r => needsArchivedThumbnail(r, thumbMode) && !String(r.archivedThumbnailUrl || '').trim()).length : 0;
     const twoStatuses = rows.map(r => parseInt(String(r.twoOeStatus || '').trim(), 10));
     const twoRedirect = twoStatuses.filter(n => n >= 300 && n < 400).length;
-    const twoNoArchive = twoStatuses.filter(n => n >= 400 && n < 500).length;
-    const twoRetry = twoStatuses.filter(n => n === -1 || n >= 500).length;
+    const twoNoArchive = twoStatuses.filter(n => n >= 400 && n < 500 && n !== 429).length;
+    const twoRetry = twoStatuses.filter(n => n === -1 || n === 429 || n >= 500).length;
     const twoUnchecked = rows.filter(r => !String(r.twoOeStatus || '').trim() || /not checked/i.test(String(r.twoOeStatus || ''))).length;
     const thumbCache = getThumbAssetCache();
     const archivedRows = includeThumb ? rows.filter(r => needsArchivedThumbnail(r, thumbMode)) : [];
     const thumbReady = archivedRows.filter(r => thumbCache[r.videoId]?.status === 'ready' && thumbCache[r.videoId]?.jpegBase64).length;
     const thumbNoCdx = archivedRows.filter(r => ['none','no_cdx'].includes(String((thumbCache[r.videoId]?.cdxStatus || thumbCache[r.videoId]?.status || r.thumbnailCdxStatus || '')).toLowerCase())).length;
     const thumbReplay404 = archivedRows.filter(r => /replay_404|found_but_replay_404|broken_replay_404/i.test(String(thumbCache[r.videoId]?.status || thumbCache[r.videoId]?.cdxStatus || r.thumbnailCdxStatus || ''))).length;
-    const thumbRetry = archivedRows.filter(r => String(thumbCache[r.videoId]?.status || '').toLowerCase() === 'retry' || /retry|timeout|5\d\d|-1/i.test(String(thumbCache[r.videoId]?.error || ''))).length;
+    const thumbRetry = archivedRows.filter(r => String(thumbCache[r.videoId]?.status || '').toLowerCase() === 'retry' || /retry|timeout|429|5\d\d|-1/i.test(String(thumbCache[r.videoId]?.error || ''))).length;
     const thumbUnavailable = archivedRows.length - thumbReady;
     log(`Export validation: rows=${rows.length} | blankTitles=${blankTitles} | blank2oeStatus=${blank2oe} | archivedThumbMissing=${missingThumb}`);
     log(`Export validation 2oe: redirect3xx=${twoRedirect} | noArchive4xx=${twoNoArchive} | retryNeeded=${twoRetry} | unchecked=${twoUnchecked}`);
