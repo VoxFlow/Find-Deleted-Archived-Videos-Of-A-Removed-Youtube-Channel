@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayback YouTube Suggestions Crawler
-// @namespace    wayback-youtube-suggestions-crawler
-// @version      0.1.83j-show-incomplete-ui-fix
+// @namespace    wayback-youtube-suggestions-crawler-gm-storage-hard-cap
+// @version      0.1.85q-range-clear-sync-light-thumb-note
 // @description  Crawl archived YouTube watch-page suggestions from Wayback CDX with cached parsing, dedupe controls, thumbnail verification, and debug export.
 // @match        https://www.youtube.com/watch?v=*
 // @match        http://www.youtube.com/watch?v=*
@@ -28,10 +28,10 @@
 
   const APP = {
     name: 'Wayback YouTube Suggestions Crawler',
-    version: '0.1.83j-show-incomplete-ui-fix',
+    version: '0.1.85q-range-clear-sync-light-thumb-note',
     versionTone: 'dev',
-    parserVersion: '0.1.83j-parser-show-incomplete-ui-fix',
-    storagePrefix: 'wytsc:',
+    parserVersion: '0.1.84j-parser-fallback-logs-cache-fix',
+    storagePrefix: 'wytsc-gmcap:',
     minAllowedYear: 2005,
     badHashes: new Set([
       'fb4584498da52e2b35a5e18003cdca7452a590e2831b57eb06025e916d83b776',
@@ -43,7 +43,12 @@
     maxHistory: 50,
     snapshotRetryBaseMs: 10000,
     snapshotRetryMaxTries: 5,
-    snapshotRetryMaxThrottleMs: 60000
+    snapshotRetryMaxThrottleMs: 60000,
+    maxStoreBytes: 512 * 1024,
+    maxLogEntries: 500,
+    storeRawCdxText: false,
+    storeSnapshotHtml: true,
+    storageDebug: true
   };
 
   const LAUNCHER_DEBUG = true;
@@ -85,11 +90,33 @@
     discarded: [],
     logs: [],
     activeImageUrl: null,
+    cdxInflight: new Map(),
     scanNonce: 0,
     oe2CancelToken: 0,
     rangeScanRunning: false,
     rangeTaskToken: 0,
     thumbTaskToken: 0,
+    fallbackThumbRunning: false,
+    fallbackThumbRerunNeeded: false,
+    fallbackThumbOwnerToken: 0,
+    cdxThumbTaskToken: 0,
+    cdxThumbRunning: false,
+    cdxThumbQueue: [],
+    cdxThumbQueued: new Set(),
+    cdxThumbActive: new Set(),
+    cdxThumbManualRequested: new Set(),
+    live0Queue: [],
+    live0Queued: new Set(),
+    live0Running: false,
+    live0TaskToken: 0,
+    logAuto: true,
+    logZoomAuto: true,
+    capturesAuto: true,
+    badCapturesAuto: true,
+    resolvedCapturesAuto: true,
+    seedScrollPositions: new Map(),
+    pendingSeedScrollRestore: null,
+    seedScrollSaveTimer: 0,
     snapshotThrottleMs: 0,
     snapshotRetryAttempt: 0,
     currentSnapshot: '',
@@ -100,9 +127,74 @@
     }
   };
 
+  function makeRunContext(seed, nonce) {
+    return { seed: normalizeSeedInput(seed || S.seed || '') || '', nonce: Number.isFinite(nonce) ? nonce : S.scanNonce };
+  }
+  function isRunContextCurrent(ctx) {
+    return !ctx || (ctx.nonce === S.scanNonce && (!ctx.seed || ctx.seed === S.seed));
+  }
+
+  function isWyscUiActive() {
+    return !!(document.body && document.body.classList && document.body.classList.contains('wytsc'));
+  }
+
+  function saveSeedScroll(seed, reason) {
+    const id = normalizeSeedInput(seed || S.seed || '');
+    if (!id || !isWyscUiActive()) return;
+    const y = Math.max(0, Math.round(window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0));
+    const x = Math.max(0, Math.round(window.scrollX || document.documentElement.scrollLeft || document.body.scrollLeft || 0));
+    S.seedScrollPositions.set(id, { x, y, savedAt: Date.now(), reason: reason || '' });
+  }
+
+  function scheduleSeedScrollSave(reason) {
+    if (!S.seed || !isWyscUiActive()) return;
+    if (S.seedScrollSaveTimer) return;
+    S.seedScrollSaveTimer = setTimeout(() => {
+      S.seedScrollSaveTimer = 0;
+      saveSeedScroll(S.seed, reason || 'scroll');
+    }, 160);
+  }
+
+  function seedScrollEntry(seed) {
+    const id = normalizeSeedInput(seed || '');
+    return id ? S.seedScrollPositions.get(id) : null;
+  }
+
+  function scheduleSeedScrollRestore(seed, reason) {
+    const id = normalizeSeedInput(seed || S.seed || '');
+    const entry = seedScrollEntry(id);
+    if (!id || !entry || typeof entry.y !== 'number') return;
+    S.pendingSeedScrollRestore = {
+      seed: id,
+      x: Number.isFinite(entry.x) ? entry.x : 0,
+      y: Math.max(0, entry.y),
+      until: Date.now() + 3200,
+      reason: reason || ''
+    };
+    runPendingSeedScrollRestore();
+  }
+
+  function runPendingSeedScrollRestore() {
+    const pending = S.pendingSeedScrollRestore;
+    if (!pending || pending.seed !== S.seed) return;
+    const apply = () => {
+      const cur = S.pendingSeedScrollRestore;
+      if (!cur || cur.seed !== S.seed) return;
+      try { window.scrollTo(cur.x || 0, cur.y || 0); } catch (_) {}
+      const diff = Math.abs((window.scrollY || 0) - (cur.y || 0));
+      const canStillGrow = Date.now() < cur.until;
+      if (canStillGrow && diff > 3) {
+        setTimeout(runPendingSeedScrollRestore, 90);
+      } else {
+        S.pendingSeedScrollRestore = null;
+      }
+    };
+    requestAnimationFrame(() => requestAnimationFrame(apply));
+  }
+
   const DEFAULT_SETTINGS = {
     theme: 'dark',
-    mode: 'day',
+    mode: 'month',
     customPagesPerInterval: 1,
     customIntervalEvery: 3,
     customIntervalUnit: 'month',
@@ -113,6 +205,12 @@
     maxMonth: 12,
     showDedupes: false,
     fallbackThumbnails: false,
+    autoCdxThumbnails: false,
+    async2oeConcurrency: 3,
+    fallbackThumbConcurrency: 2,
+    cdxThumbConcurrency: 1,
+    showOnlyUnavailable: false,
+    showOnlyStatus: 'all',
     triageOnly: false,
     scanDiscarded: false,
     sourceMode: 'desktop',
@@ -122,11 +220,249 @@
   };
 
   function key(k) { return APP.storagePrefix + k; }
-  function getStore(k, fallback) { try { return GM_getValue(key(k), fallback); } catch (_) { return fallback; } }
-  function setStore(k, v) { try { GM_setValue(key(k), v); } catch (e) { log('storage-error', String(e)); } }
+  function byteLenText(s) {
+    try { return new TextEncoder().encode(String(s)).length; }
+    catch (_) { return String(s).length; }
+  }
+  function safeJsonSize(value) {
+    try { return byteLenText(JSON.stringify(value)); }
+    catch (_) { return -1; }
+  }
+  function compactCdxRowForStore(r) {
+    if (!r) return r;
+    return {
+      cdxRowIndex: r.cdxRowIndex || null,
+      urlkey: r.urlkey || '',
+      timestamp: r.timestamp || '',
+      original: r.original || r.rawOriginalParsedFromCdx || '',
+      rawOriginalParsedFromCdx: r.rawOriginalParsedFromCdx || r.original || '',
+      mimetype: r.mimetype || '',
+      statuscode: r.statuscode || '',
+      digest: r.digest || '',
+      length: r.length || '',
+      parseError: r.parseError || '',
+      source: r.source || ''
+    };
+  }
+  function compactParsedForStore(parsed) {
+    if (!parsed || typeof parsed !== 'object') return parsed;
+    const out = Object.assign({}, parsed);
+    out.items = ((parsed.items || [])).map(item => {
+      if (!item || typeof item !== 'object') return item;
+      const x = Object.assign({}, item);
+      delete x.parseDebug;
+      return x;
+    });
+    return out;
+  }
+  function compactValueForStore(k, v) {
+    const name = String(k || '');
+    if (name.startsWith('snapshothtml:')) return { blocked: true, value: null, reason: 'raw snapshot HTML is not stored in GM storage' };
+    if (name.startsWith('cdx:') && v && Array.isArray(v.rows)) {
+      const x = Object.assign({}, v);
+      x.rows = v.rows.map(compactCdxRowForStore);
+      delete x.rawText;
+      x.rawTextSkipped = true;
+      x.compacted = true;
+      return { blocked: false, value: x };
+    }
+    if ((name.startsWith('parsed:') || name.startsWith('discardedparsed:')) && v && typeof v === 'object') {
+      return { blocked: false, value: compactParsedForStore(v) };
+    }
+    return { blocked: false, value: v };
+  }
+  function getStore(k, fallback) {
+    const full = key(k);
+    try {
+      const v = GM_getValue(full, fallback);
+      const bytes = safeJsonSize(v);
+      if (bytes > APP.maxStoreBytes) {
+        try { GM_deleteValue(full); } catch (_) {}
+        try { console.warn('[WYSC storage-deleted-oversized-read]', full, bytes); } catch (_) {}
+        return fallback;
+      }
+      return v;
+    } catch (e) {
+      try { console.warn('[WYSC storage-get-error] ' + full, e); } catch (_) {}
+      return fallback;
+    }
+  }
+  function setStore(k, v) {
+    const full = key(k);
+    try {
+      const compacted = compactValueForStore(k, v);
+      if (compacted.blocked) return false;
+      const value = compacted.value;
+      const bytes = safeJsonSize(value);
+      if (bytes < 0 || bytes > APP.maxStoreBytes) {
+        try { console.warn('[WYSC storage-blocked-too-large]', { key: full, bytes, maxStoreBytes: APP.maxStoreBytes }); } catch (_) {}
+        try { log('storage-blocked', `Skipped oversized GM write for ${k}`, { key: full, bytes, maxStoreBytes: APP.maxStoreBytes }); } catch (_) {}
+        return false;
+      }
+      GM_setValue(full, value);
+      return true;
+    } catch (e) {
+      try { log('storage-error', String(e && (e.stack || e.message || e))); } catch (_) { console.warn('[WYSC storage-set-error]', full, e); }
+      return false;
+    }
+  }
   function delStore(k) { try { GM_deleteValue(key(k)); } catch (_) {} }
   function settings() { return Object.assign({}, DEFAULT_SETTINGS, getStore('settings', {})); }
+  function normalizeShowOnlyStatus(st) {
+    const raw = String((st && st.showOnlyStatus) || '').toLowerCase();
+    if (raw === 'available' || raw === 'unavailable') return raw;
+    if (st && st.showOnlyUnavailable) return 'unavailable';
+    return 'all';
+  }
   function saveSettings(patch) { setStore('settings', Object.assign(settings(), patch)); }
+
+  const IDB = { name: 'WYSCIndexedCacheV1', store: 'kv', dbPromise: null };
+  function idbOpen() {
+    if (IDB.dbPromise) return IDB.dbPromise;
+    IDB.dbPromise = new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(IDB.name, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(IDB.store)) db.createObjectStore(IDB.store, { keyPath: 'key' });
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+      } catch (e) { reject(e); }
+    });
+    return IDB.dbPromise;
+  }
+  async function idbGet(k, fallback) {
+    try {
+      const db = await idbOpen();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB.store, 'readonly');
+        const req = tx.objectStore(IDB.store).get(String(k));
+        req.onsuccess = () => resolve(req.result ? req.result.value : fallback);
+        req.onerror = () => reject(req.error || new Error('IndexedDB get failed'));
+      });
+    } catch (e) { try { console.warn('[WYSC idb-get-error]', k, e); } catch (_) {} return fallback; }
+  }
+  async function idbSet(k, value) {
+    try {
+      const db = await idbOpen();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB.store, 'readwrite');
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB set failed'));
+        tx.objectStore(IDB.store).put({ key: String(k), value, savedAt: Date.now() });
+      });
+      return true;
+    } catch (e) { try { log('idb-error', `IndexedDB save failed for ${k}`, { error: String(e && (e.message || e)) }); } catch (_) {} return false; }
+  }
+  async function idbDelete(k) {
+    try {
+      const db = await idbOpen();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB.store, 'readwrite');
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => reject(tx.error || new Error('IndexedDB delete failed'));
+        tx.objectStore(IDB.store).delete(String(k));
+      });
+      return true;
+    } catch (_) { return false; }
+  }
+  async function idbKeys(prefix) {
+    const out = [];
+    try {
+      const db = await idbOpen();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(IDB.store, 'readonly');
+        const req = tx.objectStore(IDB.store).openKeyCursor();
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (!cur) return resolve();
+          const k = String(cur.key || '');
+          if (!prefix || k.startsWith(prefix)) out.push(k);
+          cur.continue();
+        };
+        req.onerror = () => reject(req.error || new Error('IndexedDB cursor failed'));
+      });
+    } catch (e) { try { console.warn('[WYSC idb-keys-error]', e); } catch (_) {} }
+    return out;
+  }
+  async function idbClearByPrefix(prefix) {
+    let deleted = 0;
+    for (const k of await idbKeys(prefix || '')) if (await idbDelete(k)) deleted++;
+    return deleted;
+  }
+  async function setSnapshotHtmlCache(row, value) {
+    if (!row) return false;
+    return idbSet(snapshotHtmlCacheKey(row), value);
+  }
+  async function getSnapshotHtmlCache(row) {
+    if (!row) return null;
+    const k = snapshotHtmlCacheKey(row);
+    const idbVal = await idbGet(k, null);
+    if (idbVal && typeof idbVal.html === 'string') return Object.assign({}, idbVal, { _wyscKey: k, _wyscStore: 'indexeddb' });
+    const gmVal = getStore(k, null);
+    if (gmVal && typeof gmVal.html === 'string') return Object.assign({}, gmVal, { _wyscKey: k, _wyscStore: 'gm' });
+    return null;
+  }
+  async function findSnapshotHtmlCacheByTimestamp(timestamp) {
+    const ts = String(timestamp || '');
+    if (!ts) return null;
+    for (const k of await idbKeys('snapshothtml:')) {
+      if (!k.includes(':' + ts + ':')) continue;
+      const val = await idbGet(k, null);
+      if (val && typeof val.html === 'string') return Object.assign({}, val, { _wyscKey: k, _wyscStore: 'indexeddb' });
+    }
+    return null;
+  }
+
+
+  const QUEUE_THROTTLES = {
+    oe2: { name: '2oe', level: 0, maxLevel: 8, minDelay: 350, maxDelay: 8000 },
+    thumb: { name: 'Fallback thumb', level: 0, maxLevel: 8, minDelay: 300, maxDelay: 9000 },
+    cdx: { name: 'CDX thumb', level: 0, maxLevel: 8, minDelay: 650, maxDelay: 12000 }
+  };
+  function clampInt(value, min, max, fallback) {
+    const n = parseInt(value, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+  function concurrencySetting(kind) {
+    const st = settings();
+    if (kind === 'oe2') return clampInt(st.async2oeConcurrency, 1, 8, 3);
+    if (kind === 'thumb') return clampInt(st.fallbackThumbConcurrency, 1, 4, 2);
+    if (kind === 'cdx') return clampInt(st.cdxThumbConcurrency, 1, 3, 1);
+    return 1;
+  }
+  function saveConcurrencySetting(kind, raw) {
+    const map = { oe2: ['async2oeConcurrency', 1, 8, 3, '2oe async concurrency'], thumb: ['fallbackThumbConcurrency', 1, 4, 2, 'Fallback async concurrency'], cdx: ['cdxThumbConcurrency', 1, 3, 1, 'CDX async concurrency'] };
+    const cfg = map[kind]; if (!cfg) return 1;
+    const val = clampInt(raw, cfg[1], cfg[2], cfg[3]);
+    saveSettings({ [cfg[0]]: val });
+    const el = document.getElementById(kind === 'oe2' ? 'async2oeConcurrency' : kind === 'thumb' ? 'fallbackThumbConcurrency' : 'cdxThumbConcurrency');
+    if (el) { el.value = String(val); flashApplied(el); }
+    log('settings', `${cfg[4]} applied: ${val}${S.running ? ' (running queues use it on the next round)' : ''}`, { value: val, min: cfg[1], max: cfg[2], kind });
+    return val;
+  }
+  function throttleDelay(kind, round) {
+    const t = QUEUE_THROTTLES[kind] || QUEUE_THROTTLES.oe2;
+    const level = Math.max(0, Math.min(t.maxLevel, t.level || 0));
+    const span = t.maxDelay - t.minDelay;
+    let delay = t.minDelay + Math.round(span * (level / Math.max(1, t.maxLevel)));
+    const r = Math.max(1, Number(round) || 1);
+    const roundMult = kind === 'oe2' ? [1, 1.5, 2.25, 3][Math.min(3, r - 1)] : kind === 'thumb' ? [1, 2][Math.min(1, r - 1)] : 1;
+    delay = Math.round(delay * roundMult);
+    delay += Math.round(delay * (Math.random() * 0.2 - 0.1));
+    return Math.max(0, delay);
+  }
+  async function queueDelay(kind, round, label) {
+    const t = QUEUE_THROTTLES[kind] || QUEUE_THROTTLES.oe2;
+    const delay = throttleDelay(kind, round);
+    if (delay > 0) await sleep(delay);
+    if (t.level > 0 || round > 1) log('throttle', `${t.name} throttle ${t.level}/${t.maxLevel}; slept ${(delay / 1000).toFixed(2)}s${label ? ' — ' + label : ''}`, { kind, level: t.level, maxLevel: t.maxLevel, delayMs: delay, round });
+  }
+  function throttleSuccess(kind) { const t = QUEUE_THROTTLES[kind]; if (t) t.level = Math.max(0, (t.level || 0) - 1); }
+  function throttleFail(kind) { const t = QUEUE_THROTTLES[kind]; if (t) t.level = Math.min(t.maxLevel, (t.level || 0) + 1); }
+  function looksRetryableText(s) { return /timeout|http\s*(?:429|5\d\d)|\b(?:429|5\d\d|-1)\b|network|temporar|retry|rate.?limit/i.test(String(s || '')); }
 
   function nowIso() { return new Date().toISOString(); }
   function nowLocal() {
@@ -148,10 +484,22 @@
     try { return JSON.stringify(value, null, 2); }
     catch (e) { return String(value); }
   }
+  function compactLogDataForMemory(data) {
+    if (!data || typeof data !== 'object') return data || null;
+    const out = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (k === 'rawText' || k === 'html') continue;
+      if (Array.isArray(v)) out[k] = v.slice(0, 20);
+      else if (typeof v === 'string' && v.length > 2000) out[k] = v.slice(0, 2000) + `… [trimmed ${v.length - 2000} chars]`;
+      else out[k] = v;
+    }
+    return out;
+  }
   function log(type, message, data) {
-    const row = { time: nowLocal(), timeIso: nowIso(), type, message, data: data || null };
+    const row = { time: nowLocal(), timeIso: nowIso(), type, message, data: compactLogDataForMemory(data) };
     S.logs.push(row);
-    const text = `[${APP.name}] ${type}: ${message}` + (data && data.cdxUrl ? `\nCDX: ${data.cdxUrl}` : '') + (data && data.waybackUrl ? `\nWayback: ${data.waybackUrl}` : '') + (data ? `\n${stableStringify(data)}` : '');
+    if (S.logs.length > APP.maxLogEntries) S.logs.splice(0, S.logs.length - APP.maxLogEntries);
+    const text = `[${APP.name}] ${type}: ${message}` + (row.data && row.data.cdxUrl ? `\nCDX: ${row.data.cdxUrl}` : '') + (row.data && row.data.waybackUrl ? `\nWayback: ${row.data.waybackUrl}` : '') + (row.data ? `\n${stableStringify(row.data)}` : '');
     if (/error|warn|discarded|failed/i.test(type)) console.warn(text);
     else console.log(text);
     renderLogLine(row);
@@ -313,7 +661,7 @@
 
   function looseFieldIssue(field, value) {
     const s = cleanText(value).replace(/\u00a0/g, ' ').trim();
-    if (!s) return '';
+    if (!s || s === '[None]') return '';
     if (field === 'uploader') {
       if (/^(?:by|from|de|door|von|por|par|da|di|egilea|egileak|autor|autora|criado\s+por|作者|创建者|創建者|上传者|上傳者|作成者|投稿者|アップロード者|작성자|게시자|автор|создатель|от|uploader|uploaded\s+by)\s*[:：]/i.test(s)) return 'uploader has localization prefix';
     }
@@ -409,6 +757,17 @@
     ], b));
     if (u) return cleanUploaderStat(u);
 
+    // 2015 watch7/SPF related rows often nest the actual channel name inside
+    // .stat.attribution as: by <span class="g-hovercard">Channel</span>.
+    // Prefer that inner hovercard so the captured uploader is not "by Channel"
+    // with the surrounding attribution whitespace.
+    u = stripTags(firstMatch([
+      /\bby\b\s*(?:<b\b[^>]*>\s*)?<span\b[^>]*class=["'][^"']*\bg-hovercard\b[^"']*["'][^>]*>([\s\S]{1,240}?)<\/span>/i,
+      /<span\b[^>]*class=["'][^"']*\bstat\b[^"']*\battribution\b[^"']*["'][^>]*>[\s\S]{0,500}?<span\b[^>]*class=["'][^"']*\bg-hovercard\b[^"']*["'][^>]*data-name=["']{2}[^>]*>([\s\S]{1,240}?)<\/span>/i,
+      /<span\b[^>]*class=["'][^"']*\bstat\b[^"']*\battribution\b[^"']*["'][^>]*>[\s\S]{0,500}?<span\b[^>]*data-name=["']{2}[^>]*class=["'][^"']*\bg-hovercard\b[^"']*["'][^>]*>([\s\S]{1,240}?)<\/span>/i
+    ], b));
+    if (u) return cleanUploaderStat(u);
+
     // 2013 attribution rows can contain nested g-hovercard spans:
     // <span class="stat attribution"><span class="g-hovercard">by <b><span ...>lgviewty</span></b></span></span>
     // A simple non-greedy </span> regex can stop too early, so capture until the next stat/view row or link close.
@@ -434,6 +793,21 @@
 
     // In older rows a remaining digit-only .stat can be the view count.
     return s.replace(/[^\d]/g, '');
+  }
+
+  function parseStructuredViewStatNumber(value) {
+    const s = cleanText(value).replace(/\u00a0/g, ' ').trim();
+    if (!s || !/\d/.test(s)) return '';
+    if (isFeaturedStatText(s) || isVideoCountText(s)) return '';
+    const localized = parseLocalizedViewCount(s);
+    if (localized) return localized;
+
+    // Use only when the parser already knows this field is the views slot.
+    // This avoids language lists while still preserving numeric uploader names
+    // in adjacent fields such as <span class="stat">4049</span>.
+    const m = s.match(/\d[\d\s\u00a0.,]*/);
+    if (!m) return '';
+    return m[0].replace(/[^\d]/g, '');
   }
 
   function expandShortViews(s) {
@@ -497,6 +871,21 @@
 
     return { minYear, minMonth, maxYear, maxMonth };
   }
+  function rangeLabel(range) {
+    range = normalizeRangeSettings(range || settings());
+    return `${range.minYear}-${String(range.minMonth).padStart(2, '0')} → ${range.maxYear}-${String(range.maxMonth).padStart(2, '0')}`;
+  }
+  function syncVisibleRangeControls() {
+    const st = settings();
+    const range = normalizeRangeSettings(st);
+    const set = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+    set('mode', st.mode || DEFAULT_SETTINGS.mode);
+    set('minYear', range.minYear);
+    set('minMonth', range.minMonth);
+    set('maxYear', range.maxYear);
+    set('maxMonth', range.maxMonth);
+    const sourceMode = document.getElementById('sourceMode'); if (sourceMode) sourceMode.value = st.sourceMode || DEFAULT_SETTINGS.sourceMode;
+  }
   function snapshotUrl(ts, original) { return `https://web.archive.org/web/${ts}/${original}`; }
 
   function validateCdxOriginal(original, seed, sourceMode) {
@@ -527,16 +916,39 @@
 
   function request(opts) {
     return new Promise((resolve) => {
-      GM_xmlhttpRequest({
-        method: opts.method || 'GET',
-        url: opts.url,
-        responseType: opts.responseType || 'text',
-        timeout: opts.timeout || 45000,
-        headers: opts.headers || {},
-        onload: res => resolve({ ok: res.status >= 200 && res.status < 300, status: res.status, finalUrl: res.finalUrl || opts.url, response: res.response, text: res.responseText || '' }),
-        onerror: err => resolve({ ok: false, status: -1, finalUrl: opts.url, error: String(err && err.error || err) }),
-        ontimeout: () => resolve({ ok: false, status: -1, finalUrl: opts.url, error: 'timeout' })
-      });
+      let done = false;
+      let timer = null;
+      let xhr = null;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        if (timer) clearInterval(timer);
+        resolve(value);
+      };
+      try {
+        xhr = GM_xmlhttpRequest({
+          method: opts.method || 'GET',
+          url: opts.url,
+          responseType: opts.responseType || 'text',
+          timeout: opts.timeout || 45000,
+          headers: opts.headers || {},
+          onload: res => finish({ ok: res.status >= 200 && res.status < 300, status: res.status, finalUrl: res.finalUrl || opts.url, response: res.response, text: res.responseText || '' }),
+          onerror: err => finish({ ok: false, status: -1, finalUrl: opts.url, error: String(err && err.error || err) }),
+          ontimeout: () => finish({ ok: false, status: -1, finalUrl: opts.url, error: 'timeout' }),
+          onabort: () => finish({ ok: false, status: -2, finalUrl: opts.url, error: 'cancelled' })
+        });
+        if (typeof opts.cancelCheck === 'function') {
+          timer = setInterval(() => {
+            let cancel = false;
+            try { cancel = !!opts.cancelCheck(); } catch (_) {}
+            if (!cancel || done) return;
+            try { if (xhr && typeof xhr.abort === 'function') xhr.abort(); } catch (_) {}
+            finish({ ok: false, status: -2, finalUrl: opts.url, error: 'cancelled' });
+          }, 250);
+        }
+      } catch (e) {
+        finish({ ok: false, status: -1, finalUrl: opts.url, error: String(e && e.message || e) });
+      }
     });
   }
 
@@ -559,32 +971,69 @@
       timer = setTimeout(() => done({ ok: false, width: 0, height: 0, error: 'image load timeout' }), 22000);
       img.onload = () => done({ ok: true, width: img.naturalWidth, height: img.naturalHeight });
       img.onerror = () => done({ ok: false, width: 0, height: 0, error: 'image load error' });
-      img.src = url + (url.includes('?') ? '&' : '?') + '_wytsc=' + Date.now();
+      // Do not cache-bust Wayback image URLs. Adding a query string changes the
+      // archived original URL that Wayback tries to replay, so a valid parsed
+      // page thumb can fail here even though it loads normally in the page.
+      img.src = url;
     });
   }
 
-  function makeDirectThumb(id) { return `https://i.ytimg.com/vi/${id}/hqdefault.jpg`; }
+  function makeDirectThumb(id) { return `https://img.youtube.com/vi/${id}/0.jpg`; }
   function makeTimestampDefaultThumb(id, ts) { return `https://web.archive.org/web/${ts}im_/http://i.ytimg.com/vi/${id}/default.jpg`; }
+  function thumbFilenameFromUrl(url) {
+    const m = String(url || '').match(/\/(default|mqdefault|hqdefault)\.jpg(?:[?#]|$)/i);
+    return m ? (m[1].toLowerCase() + '.jpg') : '';
+  }
+  function makeTimestampThumbLikePage(video, ts) {
+    const filename = thumbFilenameFromUrl(video && video.pageThumb) || 'default.jpg';
+    return `https://web.archive.org/web/${ts}im_/http://i.ytimg.com/vi/${video.id}/${filename}`;
+  }
 
   function thumbStateCacheKey(id) {
     return `thumbstate:${id || ''}`;
   }
 
+  function cleanLive0Reason(reason, fallback) {
+    const r = String(reason || fallback || '').replace(/\s*\(\d+x\d+\)\s*$/i, '').trim();
+    return r || fallback || 'live 0.jpg status unknown';
+  }
+
+  function deriveVideoStatusFromEvidence(video) {
+    // Video status is intentionally based only on the current img.youtube.com 0.jpg HTTP check.
+    // 2oe/page/timestamp/CDX thumbnail results must not affect these two fields.
+    const lt = video && video.liveThumb && String(video.liveThumb.liveStatus || '').toLowerCase();
+    if (lt === 'live') return { status: 'Available', reason: cleanLive0Reason(video.liveThumb.reason, 'live 0.jpg status 200') };
+    if (lt === 'not-live-candidate') return { status: 'Unavailable', reason: cleanLive0Reason(video.liveThumb.reason, 'live 0.jpg HTTP 404') };
+    if (lt === 'retry') return { status: 'Pending', reason: cleanLive0Reason(video.liveThumb.reason, 'live 0.jpg retry/unknown') };
+    return { status: 'Pending', reason: 'live 0.jpg not checked' };
+  }
+
+  function updateVideoStatusFromEvidence(video) {
+    if (!video) return;
+    const ev = deriveVideoStatusFromEvidence(video);
+    video.videoStatus = ev.status;
+    video.videoStatusReason = ev.reason;
+  }
+
   function hasFinalThumbState(video) {
     if (!video) return false;
-    return /Live thumbnail (available|unavailable)/i.test(String(video.videoStatus || '')) || !!video.liveThumb;
+    return !!(video.liveThumb || video.displayThumb || /loaded|placeholder|failed|unavailable/i.test(String(video.thumbnailStatus || '')));
   }
 
   function saveThumbState(video) {
     if (!video || !video.id || !hasFinalThumbState(video)) return;
     setStore(thumbStateCacheKey(video.id), {
       id: video.id,
-      videoStatus: video.videoStatus || '',
       thumbnailStatus: video.thumbnailStatus || '',
       thumbnailReason: video.thumbnailReason || '',
       usedPreviewThumb: video.usedPreviewThumb || '',
       displayThumb: video.displayThumb || '',
+      videoStatus: video.videoStatus || '',
+      videoStatusReason: video.videoStatusReason || '',
       liveThumb: video.liveThumb || null,
+      cdxThumb: video.cdxThumb || null,
+      fallbackThumbStatus: video.fallbackThumbStatus || '',
+      fallbackThumbReason: video.fallbackThumbReason || '',
       thumbDebug: Array.isArray(video.thumbDebug) ? video.thumbDebug.slice(-5) : [],
       savedAt: Date.now(),
       appVersion: APP.version
@@ -595,9 +1044,10 @@
     if (!video || !video.id || hasFinalThumbState(video)) return false;
     const cached = getStore(thumbStateCacheKey(video.id), null);
     if (!cached) return false;
-    ['videoStatus', 'thumbnailStatus', 'thumbnailReason', 'usedPreviewThumb', 'displayThumb', 'liveThumb', 'thumbDebug'].forEach(k => {
+    ['thumbnailStatus', 'thumbnailReason', 'usedPreviewThumb', 'displayThumb', 'videoStatus', 'videoStatusReason', 'liveThumb', 'cdxThumb', 'fallbackThumbStatus', 'fallbackThumbReason', 'thumbDebug'].forEach(k => {
       if (cached[k] != null && cached[k] !== '') video[k] = cached[k];
     });
+    updateVideoStatusFromEvidence(video);
     return hasFinalThumbState(video);
   }
 
@@ -607,33 +1057,56 @@
     S.stats.thumbnailDone = vals.filter(hasFinalThumbState).length;
   }
 
-  async function verifyImage(url, kind) {
-    const cacheKey = 'thumb:' + url;
+  async function verifyImage(url, kind, ctx) {
+    if (!isRunContextCurrent(ctx)) return null;
+    const cacheKey = kind === 'live-hq' ? 'live0-http:' + url : 'thumb:' + url;
     const cached = getStore(cacheKey, null);
     if (cached && (!cached.failedAt || Date.now() - cached.failedAt < APP.failCacheMs)) return cached;
+
+    // Live availability is HTTP-status only. Do not decode dimensions or use 120x90/hash logic here.
+    // The visible preview uses the same img.youtube.com/vi/ID/0.jpg URL, but status comes from GM HEAD/GET.
+    if (kind === 'live-hq') {
+      let head = await request({ method: 'HEAD', url, timeout: 20000, cancelCheck: () => !isRunContextCurrent(ctx) });
+      let status = head.status;
+      if (status === 0 || status === 405) {
+        head = await request({ method: 'GET', url, timeout: 25000, cancelCheck: () => !isRunContextCurrent(ctx) });
+        status = head.status;
+      }
+      // A stale-run cancellation is not a real live0 failure. Do not cache it and do not
+      // convert it into Pending/retry for the current seed.
+      if (status === -2 && ctx) return null;
+      const result = { url, kind, dims: null, status, hash: null, badHash: false, liveStatus: 'unknown', reason: '', liveHttpOnlyVersion: 2 };
+      if (status >= 200 && status < 300) {
+        result.liveStatus = 'live';
+        result.reason = `live 0.jpg status ${status}`;
+      } else if (status >= 400 && status < 500) {
+        result.liveStatus = 'not-live-candidate';
+        result.reason = `live 0.jpg HTTP ${status}`;
+        result.failedAt = Date.now();
+      } else {
+        result.liveStatus = 'retry';
+        result.reason = `live 0.jpg retry/unknown HTTP ${status}`;
+        result.failedAt = Date.now();
+      }
+      setStore(cacheKey, result);
+      return result;
+    }
+
     const dims = await loadImageDims(url);
+    if (!isRunContextCurrent(ctx)) return null;
     let result = { url, kind, dims, status: null, hash: null, badHash: false, liveStatus: 'unknown', reason: '' };
     if (!dims.ok) {
-      const head = await request({ method: 'HEAD', url, timeout: 20000 });
+      const head = await request({ method: 'HEAD', url, timeout: 20000, cancelCheck: () => !isRunContextCurrent(ctx) });
+      if (!isRunContextCurrent(ctx) || head.status === -2) return null;
       result.status = head.status;
       result.reason = `image failed to load; HEAD status ${head.status}`;
       result.failedAt = Date.now();
       setStore(cacheKey, result);
       return result;
     }
-    if (kind === 'live-hq') {
-      if (dims.width === 120 && dims.height === 90) {
-        result.liveStatus = 'not-live-candidate';
-        result.reason = 'live hqdefault is exactly 120x90';
-      } else {
-        result.liveStatus = 'live';
-        result.reason = `live hqdefault dimensions ${dims.width}x${dims.height}`;
-      }
-      setStore(cacheKey, result);
-      return result;
-    }
     if (dims.width === 120 && dims.height === 90) {
-      const get = await request({ method: 'GET', url, responseType: 'arraybuffer', timeout: 30000 });
+      const get = await request({ method: 'GET', url, responseType: 'arraybuffer', timeout: 30000, cancelCheck: () => !isRunContextCurrent(ctx) });
+      if (!isRunContextCurrent(ctx) || get.status === -2) return null;
       result.status = get.status;
       if (get.ok && get.response) {
         result.hash = await sha256Hex(get.response);
@@ -655,78 +1128,307 @@
     return result;
   }
 
-  async function verifyVideoThumb(video, captureTs) {
+  function liveThumbIsGood(video) {
+    return !!(video && video.liveThumb && String(video.liveThumb.liveStatus || '').toLowerCase() === 'live');
+  }
+
+  function fallbackThumbIsLoaded(video) {
+    if (!video) return false;
+    return String(video.fallbackThumbStatus || '').toLowerCase() === 'found' || /^Fallback (page thumb|timestamp thumb)$/i.test(String(video.thumbnailStatus || ''));
+  }
+
+  function fallbackThumbFailed(video) {
+    if (!video) return false;
+    return String(video.fallbackThumbStatus || '').toLowerCase() === 'failed' || /^Fallback failed$/i.test(String(video.thumbnailStatus || ''));
+  }
+
+  function cdxThumbIsManual(video) {
+    return !!(video && video.cdxThumb && video.cdxThumb.status === 'found' && video.cdxThumb.manual === true);
+  }
+
+  function cdxThumbFinalAutoState(video) {
+    if (!video || !video.id) return false;
+    const cached = video.cdxThumb || getStore(cdxThumbCacheKey(video.id), null);
+    if (!cached || !cached.status || cdxThumbIsRetryable(cached)) return false;
+    const s = String(cached.status || '').toLowerCase();
+    if (!(s === 'found' || s === 'failed' || s === 'none')) return false;
+    video.cdxThumb = cached;
+    return true;
+  }
+
+  function fallbackThumbIsTerminal(video) {
+    return fallbackThumbIsLoaded(video) || fallbackThumbFailed(video) || /^(Fallback page thumb|Fallback timestamp thumb|Fallback failed)$/i.test(String(video && video.thumbnailStatus || ''));
+  }
+
+  function fallbackRunStillValid(opts) {
+    opts = opts || {};
+    const seed = opts.seed || (opts.ctx && opts.ctx.seed) || '';
+    return !!settings().fallbackThumbnails && !S.stopped && (!seed || seed === S.seed) && (!opts.nonce || opts.nonce === S.scanNonce) && (!opts.thumbToken || opts.thumbToken === S.thumbTaskToken) && (!opts.ctx || isRunContextCurrent(opts.ctx));
+  }
+
+  function fallbackApplyStillValid(opts, video) {
+    opts = opts || {};
+    if (!fallbackRunStillValid(opts)) return false;
+    if (video && video.id && !S.videos.has(video.id)) return false;
+    return true;
+  }
+
+  function shouldQueueThumbCheck(video) {
+    if (!video || !video.id || !settings().fallbackThumbnails) return false;
+    applyCachedThumbState(video);
+    // Auto fallback is an archived-thumbnail upgrade path only. It must not start
+    // live 0.jpg checks by itself when Auto Fallback is OFF, and it must not run
+    // for known Available/Pending videos. Live 0.jpg status is handled separately.
+    const vs = deriveVideoStatusFromEvidence(video).status;
+    if (vs !== 'Unavailable') return false;
+    // CDX no-results/failed should not permanently block page/timestamp fallback.
+    // Only a found/manual CDX thumb or an already terminal fallback result blocks fallback work.
+    if (cdxThumbFound(video) || cdxThumbIsManual(video) || fallbackThumbIsTerminal(video)) return false;
+    return !/checking|queued/i.test(String(video.thumbnailStatus || ''));
+  }
+
+  function describeThumbResult(label, result) {
+    if (!result) return `${label} missing`;
+    const dims = result.dims || {};
+    const wh = (dims.width && dims.height) ? `${dims.width}x${dims.height}` : 'unknown size';
+    if (dims.width === 120 && dims.height === 90) {
+      if (result.liveStatus === 'usable-fallback') return `${label} 120x90 GOOD hash`;
+      if (result.liveStatus === 'bad-fallback') return `${label} 120x90 BAD hash`;
+      return `${label} 120x90 unknown hash`;
+    }
+    if (result.liveStatus === 'usable-fallback') return `${label} dimensions ${wh}`;
+    return `${label} failed (${result.reason || wh})`;
+  }
+
+  function applyLiveThumbBaseline(video, direct) {
+    if (!video || !video.id) return;
+    video.liveThumb = direct;
+    video.displayThumb = (direct && direct.url) ? direct.url : makeDirectThumb(video.id);
+    const liveStatus = direct && String(direct.liveStatus || '').toLowerCase();
+    if (liveStatus === 'live') {
+      video.usedPreviewThumb = 'live 0.jpg';
+      video.thumbnailStatus = 'Live 0.jpg loaded';
+      video.thumbnailReason = cleanLive0Reason(direct && direct.reason, 'live 0.jpg status 200');
+    } else if (liveStatus === 'not-live-candidate') {
+      video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+      if (!cdxThumbFound(video) && !fallbackThumbIsLoaded(video) && !/checking|queued|fallback failed/i.test(String(video.thumbnailStatus || ''))) {
+        video.thumbnailStatus = 'Archived thumb not checked';
+        video.thumbnailReason = 'live preview unavailable; archived fallback/CDX not checked';
+      }
+    } else if (liveStatus === 'retry') {
+      video.usedPreviewThumb = 'live 0.jpg pending';
+      if (!cdxThumbFound(video) && !fallbackThumbIsLoaded(video) && !/checking|queued|fallback failed/i.test(String(video.thumbnailStatus || ''))) {
+        video.thumbnailStatus = 'Archived thumb waiting';
+        video.thumbnailReason = cleanLive0Reason(direct && direct.reason, 'live 0.jpg retry/unknown');
+      }
+    } else {
+      video.usedPreviewThumb = video.usedPreviewThumb || 'live 0.jpg pending';
+      video.thumbnailStatus = video.thumbnailStatus || 'Archived thumb waiting';
+      video.thumbnailReason = video.thumbnailReason || 'waiting for live 0.jpg status check';
+    }
+    updateVideoStatusFromEvidence(video);
+  }
+
+  function live0StatusIsFinal(video) {
+    const st = video && video.liveThumb && String(video.liveThumb.liveStatus || '').toLowerCase();
+    return st === 'live' || st === 'not-live-candidate';
+  }
+
+  function shouldQueueLive0Status(video) {
+    if (!video || !isValidVideoId(video.id)) return false;
+    applyCachedThumbState(video);
+    return !live0StatusIsFinal(video);
+  }
+
+  function scheduleLive0StatusChecks(videos, reason) {
+    const list = Array.isArray(videos) ? videos : Array.from(videos || []);
+    let added = 0;
+    for (const video of list) {
+      if (!shouldQueueLive0Status(video)) continue;
+      if (S.live0Queued.has(video.id)) continue;
+      S.live0Queued.add(video.id);
+      S.live0Queue.push(video.id);
+      added++;
+    }
+    if (added) runLive0StatusQueue(reason || 'new videos');
+    return added;
+  }
+
+  async function runLive0StatusQueue(reason) {
+    if (S.live0Running) return;
+    S.live0Running = true;
+    const token = ++S.live0TaskToken;
+    const stats = { checked: 0, available: 0, unavailable: 0, retry: 0, errors: 0 };
+    const conc = 12;
+    let renderDirty = false;
+    async function worker() {
+      while (token === S.live0TaskToken && !S.stopped) {
+        while (S.paused && !S.stopped && token === S.live0TaskToken) await sleep(250);
+        const id = S.live0Queue.shift();
+        if (!id) break;
+        S.live0Queued.delete(id);
+        const video = S.videos.get(id);
+        if (!video || live0StatusIsFinal(video)) continue;
+        try {
+          const direct = await verifyImage(makeDirectThumb(id), 'live-hq');
+          applyLiveThumbBaseline(video, direct);
+          saveThumbState(video);
+          const st = String(direct && direct.liveStatus || '').toLowerCase();
+          stats.checked++;
+          if (st === 'live') stats.available++;
+          else if (st === 'not-live-candidate') stats.unavailable++;
+          else stats.retry++;
+          renderDirty = true;
+        } catch (e) {
+          if (token !== S.live0TaskToken || S.stopped) break;
+          stats.checked++;
+          stats.errors++;
+          const v = S.videos.get(id);
+          if (v) {
+            v.liveThumb = { url: makeDirectThumb(id), kind: 'live-hq', liveStatus: 'retry', status: -1, reason: 'live 0.jpg retry/unknown exception' };
+            updateVideoStatusFromEvidence(v);
+          }
+        }
+        if (stats.checked % 12 === 0 && renderDirty) {
+          renderVideoList();
+          renderStats();
+          renderDirty = false;
+          await sleep(0);
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: conc }, () => worker()));
+    if (token === S.live0TaskToken) {
+      S.live0Running = false;
+      if (renderDirty || stats.checked) { renderVideoList(); renderStats(); }
+      if (stats.checked && (stats.retry || stats.errors)) {
+        log('live-status', `checked ${stats.checked} live 0.jpg statuses: ${stats.available} available, ${stats.unavailable} unavailable, ${stats.retry} retry, ${stats.errors} error`, { reason: reason || '', concurrency: conc, ...stats });
+      }
+      if (stats.unavailable) {
+        if (settings().fallbackThumbnails) checkThumbnailsForCurrentCaptures('live 0.jpg status finished');
+        if (settings().autoCdxThumbnails) queueCdxThumbsForCurrentVideos('live 0.jpg status finished');
+      }
+      if (S.live0Queue.length && !S.stopped) runLive0StatusQueue(reason || 'continued');
+    }
+  }
+
+  async function verifyVideoThumb(video, captureTs, opts) {
+    opts = opts || {};
+    const ctx = opts.ctx || makeRunContext(opts.seed || S.seed, opts.nonce);
+    opts.ctx = ctx;
+    opts.seed = opts.seed || ctx.seed;
     if (!video || !video.id) return video;
-    if (applyCachedThumbState(video)) {
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    const cachedApplied = applyCachedThumbState(video);
+    const fallbackOn = settings().fallbackThumbnails && (!opts.autoFallback || fallbackApplyStillValid(opts, video));
+    if (cachedApplied && (!fallbackOn || liveThumbIsGood(video) || fallbackThumbIsLoaded(video))) {
+      updateVideoStatusFromEvidence(video);
       updateThumbnailStatsFromVideos();
       return video;
     }
-    const direct = await verifyImage(makeDirectThumb(video.id), 'live-hq');
     video.thumbDebug = video.thumbDebug || [];
-    video.thumbDebug.push(direct);
-    video.liveThumb = direct;
-    if (direct.liveStatus === 'live') {
-      video.displayThumb = direct.url;
-      video.videoStatus = 'Live thumbnail available';
-      video.thumbnailStatus = 'Showing live thumbnail';
-      video.thumbnailReason = direct.reason;
-      video.usedPreviewThumb = 'live hqdefault';
+
+    let direct = video.liveThumb || null;
+    if (!direct) {
+      direct = await verifyImage(makeDirectThumb(video.id), 'live-hq', ctx);
+      video.thumbDebug.push(direct);
+    }
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    if (!direct) return video;
+    applyLiveThumbBaseline(video, direct);
+    if (!fallbackOn || direct.liveStatus === 'live') {
       saveThumbState(video);
       updateThumbnailStatsFromVideos();
       return video;
     }
 
-    video.videoStatus = 'Live thumbnail unavailable';
-    if (!settings().fallbackThumbnails) {
-      if (video.pageThumb) {
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    video.thumbnailStatus = 'Checking page thumb';
+    video.thumbnailReason = 'loading archived page thumb';
+    video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+    log('thumb-fallback', `checking page thumb ${captureTs || ''} ${video.id} ${video.title ? '— ' + video.title : ''}`, {
+      thumbLinks: video.pageThumb ? [{ label: 'page thumb ↗', url: video.pageThumb }] : []
+    });
+
+    const pageThumb = video.pageThumb ? await verifyImage(video.pageThumb, 'page-thumb-exact', ctx) : null;
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    if (pageThumb) video.thumbDebug.push(pageThumb);
+    if (pageThumb && pageThumb.liveStatus === 'usable-fallback') {
+      if (!cdxThumbIsManual(video)) {
         video.displayThumb = video.pageThumb;
-        video.thumbnailStatus = 'Showing parsed thumbnail URL';
-        video.thumbnailReason = 'live hqdefault is 120x90; fallback thumbnail checks OFF; parsed thumbnail URL has not been verified here';
-        video.usedPreviewThumb = 'parsed page thumbnail URL';
-      } else {
-        video.displayThumb = direct.url;
-        video.thumbnailStatus = 'Showing live placeholder';
-        video.thumbnailReason = 'live hqdefault is 120x90; no parsed thumbnail URL; fallback thumbnail checks OFF';
-        video.usedPreviewThumb = 'live hqdefault 120x90 placeholder';
-      }
+        video.thumbnailStatus = 'Fallback page thumb';
+        video.thumbnailReason = describeThumbResult('page thumb', pageThumb);
+        video.usedPreviewThumb = 'page thumb';
+        video.fallbackThumbStatus = 'found';
+        video.fallbackThumbReason = video.thumbnailReason;
+      } else refreshVideoPreview(video, { manual: true });
       saveThumbState(video);
       updateThumbnailStatsFromVideos();
+      log('thumb-fallback', `loaded page thumb ${video.id}: ${video.thumbnailReason}`, {
+        thumbLinks: video.pageThumb ? [{ label: 'page thumb ↗', url: video.pageThumb }] : []
+      });
       return video;
     }
-    const pageThumb = video.pageThumb ? await verifyImage(video.pageThumb, 'page-thumb-exact') : null;
-    if (pageThumb) {
-      video.thumbDebug.push(pageThumb);
-      if (pageThumb.liveStatus === 'usable-fallback') {
-        video.displayThumb = video.pageThumb;
-        video.thumbnailStatus = 'Showing verified parsed thumbnail';
-        video.thumbnailReason = pageThumb.reason;
-        video.usedPreviewThumb = 'verified parsed page thumbnail';
-        saveThumbState(video);
-        updateThumbnailStatsFromVideos();
-        return video;
-      }
-    }
-    const tsThumb = await verifyImage(makeTimestampDefaultThumb(video.id, captureTs), 'timestamp-default');
+
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    video.thumbnailStatus = 'Checking timestamp thumb';
+    video.thumbnailReason = 'page thumb failed; trying timestamp thumb';
+    video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+    const tsThumbUrl = makeTimestampThumbLikePage(video, captureTs || video.firstSeen || '');
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    log('thumb-fallback', `checking timestamp thumb ${captureTs || ''} ${video.id}`, {
+      thumbLinks: tsThumbUrl ? [{ label: 'timestamp thumb ↗', url: tsThumbUrl }] : []
+    });
+
+    const tsThumb = await verifyImage(tsThumbUrl, 'timestamp-thumb', ctx);
+    if ((opts.autoFallback || opts.ctx) && !fallbackApplyStillValid(opts, video)) return video;
+    if (!tsThumb) return video;
     video.thumbDebug.push(tsThumb);
     if (tsThumb.liveStatus === 'usable-fallback') {
-      video.displayThumb = tsThumb.url;
-      video.thumbnailStatus = 'Showing timestamp thumbnail';
-      video.thumbnailReason = tsThumb.reason;
-      video.usedPreviewThumb = 'timestamp default thumbnail';
+      if (!cdxThumbIsManual(video)) {
+        video.displayThumb = tsThumb.url;
+        video.thumbnailStatus = 'Fallback timestamp thumb';
+        video.thumbnailReason = `${describeThumbResult('page thumb', pageThumb)}; ${describeThumbResult('timestamp thumb', tsThumb)}`;
+        video.usedPreviewThumb = 'timestamp thumb';
+        video.fallbackThumbStatus = 'found';
+        video.fallbackThumbReason = video.thumbnailReason;
+      } else refreshVideoPreview(video, { manual: true });
+      log('thumb-fallback', `loaded timestamp thumb ${video.id}: ${describeThumbResult('timestamp thumb', tsThumb)}`, {
+        thumbLinks: tsThumbUrl ? [{ label: 'timestamp thumb ↗', url: tsThumbUrl }] : []
+      });
     } else {
-      video.displayThumb = direct.url;
-      video.thumbnailStatus = 'No verified fallback thumbnail';
-      video.thumbnailReason = `live hq 120x90; parsed thumbnail ${pageThumb ? pageThumb.reason : 'missing'}; timestamp fallback ${tsThumb.reason}`;
-      video.usedPreviewThumb = 'live hqdefault 120x90 placeholder';
+      if (!cdxThumbFound(video)) {
+        video.displayThumb = direct.url || makeDirectThumb(video.id);
+        video.thumbnailStatus = 'Fallback failed';
+        video.thumbnailReason = `${describeThumbResult('page thumb', pageThumb)}; ${describeThumbResult('timestamp thumb', tsThumb)}`;
+        video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+        video.fallbackThumbStatus = 'failed';
+        video.fallbackThumbReason = video.thumbnailReason;
+      } else refreshVideoPreview(video);
+      log('thumb-fallback', `failed fallback ${video.id}: ${video.thumbnailReason}`, {
+        thumbLinks: [
+          ...(video.pageThumb ? [{ label: 'page thumb ↗', url: video.pageThumb }] : []),
+          ...(tsThumbUrl ? [{ label: 'timestamp thumb ↗', url: tsThumbUrl }] : [])
+        ]
+      });
     }
     saveThumbState(video);
     updateThumbnailStatsFromVideos();
     return video;
   }
 
-  async function verifyCaptureThumbs(capture, nonce) {
+  async function verifyCaptureThumbs(capture, nonce, ctx) {
+    ctx = ctx || makeRunContext(S.seed, nonce);
+    if (!isRunContextCurrent(ctx)) return;
     if (!capture || !capture.ok || !Array.isArray(capture.items) || !capture.items.length) return;
+    if (!settings().fallbackThumbnails) return;
+    const seed = ctx.seed || S.seed;
     const thumbToken = S.thumbTaskToken;
+    const runOpts = { autoFallback: true, nonce, thumbToken, seed, ctx };
     const queued = [];
     const seen = new Set();
     for (const item of capture.items) {
@@ -734,69 +1436,141 @@
       seen.add(item.id);
       const video = S.videos.get(item.id);
       if (!video) continue;
-      if (applyCachedThumbState(video)) continue;
-      if (hasFinalThumbState(video)) continue;
+      if (!shouldQueueThumbCheck(video)) continue;
       queued.push(video);
     }
-    for (const video of queued) {
-      if (S.stopped || nonce !== S.scanNonce || thumbToken !== S.thumbTaskToken) break;
-      while (S.paused && !S.stopped && nonce === S.scanNonce && thumbToken === S.thumbTaskToken) await sleep(300);
-      if (S.stopped || nonce !== S.scanNonce || thumbToken !== S.thumbTaskToken) break;
-      video.videoStatus = 'Checking live thumbnail';
-      if (video.pageThumb) {
-        video.thumbnailStatus = 'Showing parsed thumbnail URL';
-        video.thumbnailReason = 'live thumbnail check is running; parsed thumbnail URL has not been verified here';
-        video.displayThumb = video.pageThumb;
-        video.usedPreviewThumb = 'parsed page thumbnail URL';
-      } else {
-        video.thumbnailStatus = 'Checking live thumbnail';
-        video.thumbnailReason = 'waiting for hqdefault dimension check';
-        video.displayThumb = makeDirectThumb(video.id);
-        video.usedPreviewThumb = 'live hqdefault (checking)';
+    if (queued.length && fallbackRunStillValid(runOpts)) {
+      log('thumb-fallback', `capture ${capture.timestamp || ''}: queued ${queued.length} archived thumbnail fallback check(s)`, { concurrency: concurrencySetting('thumb'), throttle: `${QUEUE_THROTTLES.thumb.level}/${QUEUE_THROTTLES.thumb.maxLevel}` });
+      for (const video of queued) {
+        if (!fallbackRunStillValid(runOpts)) continue;
+        const lt = video.liveThumb && String(video.liveThumb.liveStatus || '').toLowerCase();
+        if (!cdxThumbFound(video) && !/^CDX queued|Checking CDX thumb$/i.test(String(video.thumbnailStatus || '')) && (lt === 'not-live-candidate' || /placeholder|archived thumb not checked/i.test(String(video.thumbnailStatus || '')))) {
+          video.thumbnailStatus = 'Fallback queued';
+          video.thumbnailReason = 'waiting to check page thumb';
+          video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+          video.displayThumb = video.displayThumb || makeDirectThumb(video.id);
+        }
       }
       renderVideoList();
       renderStats();
-      await verifyVideoThumb(video, video.firstSeen);
-      if (S.stopped || nonce !== S.scanNonce || thumbToken !== S.thumbTaskToken) {
-        resetCheckingThumbStatuses('thumbnail check cancelled');
-        break;
-      }
-      renderVideoList();
-      renderStats();
-      await sleep(50);
     }
+    const conc = concurrencySetting('thumb');
+    let next = 0, done = 0;
+    async function worker(workerId) {
+      while (fallbackRunStillValid(runOpts)) {
+        const i = next++;
+        if (i >= queued.length) break;
+        const video = queued[i];
+        while (S.paused && fallbackRunStillValid(runOpts)) await sleep(300);
+        if (!fallbackRunStillValid(runOpts)) break;
+        if (!cdxThumbFound(video) && !/^CDX queued|Checking CDX thumb$/i.test(String(video.thumbnailStatus || ''))) {
+          video.thumbnailStatus = 'Checking page thumb';
+          video.thumbnailReason = 'loading archived page thumb';
+          video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
+          video.displayThumb = video.displayThumb || makeDirectThumb(video.id);
+        }
+        log('thumb-fallback', `checking ${i + 1}/${queued.length} in capture ${capture.timestamp || ''}: ${video.id}${video.title ? ' — ' + video.title : ''}`, { worker: workerId, concurrency: conc, throttle: `${QUEUE_THROTTLES.thumb.level}/${QUEUE_THROTTLES.thumb.maxLevel}` });
+        renderVideoList();
+        renderStats();
+        await queueDelay('thumb', 1, `${i + 1}/${queued.length} worker ${workerId}`);
+        const before = String(video.thumbnailStatus || '');
+        try {
+          await verifyVideoThumb(video, capture.timestamp || video.firstSeen, runOpts);
+          if (!fallbackRunStillValid(runOpts)) {
+            resetCheckingThumbStatuses('thumbnail check cancelled');
+            break;
+          }
+          if (looksRetryableText(video.thumbnailReason)) throttleFail('thumb'); else throttleSuccess('thumb');
+          refreshVideoPreview(video);
+          if (fallbackRunStillValid(runOpts) && settings().autoCdxThumbnails && autoCdxLeftoversOnlyMode() && fallbackThumbFailed(video)) queueCdxThumbsForCurrentVideos('fallback failed');
+        } catch (e) {
+          throttleFail('thumb');
+          log('thumb-fallback-error', `${video.id}: ${e && (e.message || e)}`, { videoId: video.id, worker: workerId });
+        }
+        if (!fallbackRunStillValid(runOpts)) {
+          resetCheckingThumbStatuses('thumbnail check cancelled');
+          break;
+        }
+        done++;
+        if (done % 5 === 0 || done === queued.length) log('thumb-fallback', `async progress ${done}/${queued.length}`, { done, total: queued.length, concurrency: conc, throttle: `${QUEUE_THROTTLES.thumb.level}/${QUEUE_THROTTLES.thumb.maxLevel}` });
+        renderVideoList();
+        renderStats();
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(conc, queued.length || 1) }, (_, i) => worker(i + 1)));
   }
 
   function resetCheckingThumbStatuses(reason) {
     let changed = 0;
     for (const video of S.videos.values()) {
       if (!video) continue;
-      if (video.videoStatus === 'Checking live thumbnail' || video.thumbnailStatus === 'Checking hqdefault' || video.thumbnailStatus === 'Checking live thumbnail') {
-        video.videoStatus = 'Thumbnail not checked';
-        video.thumbnailStatus = video.pageThumb ? 'Parsed thumbnail URL found' : 'No thumbnail source selected';
-        video.thumbnailReason = reason || 'background thumbnail check was cancelled';
-        video.usedPreviewThumb = video.usedPreviewThumb === 'live hqdefault (checking)' ? 'unchecked' : (video.usedPreviewThumb || 'unchecked');
-        changed++;
+      const status = String(video.thumbnailStatus || '');
+      const isFallbackQueueState = /^(Fallback queued|Checking page thumb|Checking timestamp thumb|Checking fallback thumb)$/i.test(status);
+      if (!isFallbackQueueState) continue;
+      // Queue cancellation is not a final thumbnail result. Do not overwrite active CDX
+      // states such as "CDX queued" / "Checking CDX thumb" when both auto queues run.
+      video.displayThumb = video.displayThumb || makeDirectThumb(video.id);
+      if (fallbackThumbFailed(video)) {
+        // Keep the real fallback failure if it already exists.
+      } else if (video.cdxThumb && /^(checking|retry|found)$/i.test(String(video.cdxThumb.status || ''))) {
+        if (/^checking$/i.test(String(video.cdxThumb.status || ''))) {
+          video.thumbnailStatus = 'Checking CDX thumb';
+          video.thumbnailReason = 'querying CDX thumbnail captures';
+        } else if (/^retry$/i.test(String(video.cdxThumb.status || ''))) {
+          video.thumbnailStatus = 'CDX retry-needed';
+          video.thumbnailReason = video.cdxThumb.reason || 'CDX thumbnail retry needed';
+        } else if (cdxThumbFound(video)) {
+          applyCdxThumbPreview(video, { manual: cdxThumbIsManual(video), leftoversOnly: autoCdxLeftoversOnlyMode() });
+        }
+      } else {
+        video.thumbnailStatus = 'Archived thumb not checked';
+        video.thumbnailReason = reason || 'fallback thumbnail queue cancelled; archived thumb not checked';
+        video.usedPreviewThumb = 'live 0.jpg unavailable placeholder';
       }
+      changed++;
     }
     if (changed) {
-      log('thumbnail-checks', `Reset ${changed} unfinished thumbnail check(s)${reason ? ' — ' + reason : ''}`, { changed, reason: reason || '' });
+      log('thumbnail-checks', `Reset ${changed} unfinished fallback thumbnail check(s)${reason ? ' — ' + reason : ''}`, { changed, reason: reason || '' });
       renderVideoList();
       renderStats();
     }
   }
 
   async function checkThumbnailsForCurrentCaptures(reason) {
-    const nonce = S.scanNonce;
-    const thumbToken = ++S.thumbTaskToken;
-    const captures = (S.parsedCaptures || []).filter(c => captureIsStillSelected(c));
-    if (!captures.length) return;
-    log('thumbnail-checks', `Checking thumbnails for ${captures.length} visible capture(s)${reason ? ' — ' + reason : ''}`, { captures: captures.length, reason: reason || '' });
-    for (const cap of captures) {
-      if (S.stopped || nonce !== S.scanNonce || thumbToken !== S.thumbTaskToken) break;
-      await verifyCaptureThumbs(cap, nonce);
-      if (S.stopped || nonce !== S.scanNonce || thumbToken !== S.thumbTaskToken) break;
-      await sleep(20);
+    if (!settings().fallbackThumbnails) return;
+    if (S.fallbackThumbRunning) {
+      S.fallbackThumbRerunNeeded = true;
+      if (reason === 'toggle ON' || reason === 'fallback thumbnail toggle ON') log('thumb-fallback', `thumbnail queue already running; will rescan newly eligible captures${reason ? ' — ' + reason : ''}`, { reason: reason || '' });
+      return;
+    }
+    S.fallbackThumbRunning = true;
+    let activeThumbOwner = 0;
+    try {
+      do {
+        S.fallbackThumbRerunNeeded = false;
+        const nonce = S.scanNonce;
+        const ctx = makeRunContext(S.seed, nonce);
+        const thumbToken = ++S.thumbTaskToken;
+        activeThumbOwner = thumbToken;
+        S.fallbackThumbOwnerToken = thumbToken;
+        const runOpts = { nonce, thumbToken, seed: ctx.seed, ctx };
+        const captures = (S.parsedCaptures || []).filter(c => captureIsStillSelected(c));
+        if (!captures.length) return;
+        if (!fallbackRunStillValid(runOpts)) return;
+        log('thumb-fallback', `thumbnail queue started for ${captures.length} selected capture(s)${reason ? ' — ' + reason : ''}`, { captures: captures.length, reason: reason || '' });
+        for (const cap of captures) {
+          if (!fallbackRunStillValid(runOpts)) break;
+          await verifyCaptureThumbs(cap, nonce, ctx);
+          if (!fallbackRunStillValid(runOpts)) break;
+          await sleep(20);
+        }
+        reason = 'continued';
+      } while (settings().fallbackThumbnails && S.fallbackThumbRerunNeeded && !S.stopped && isRunContextCurrent(makeRunContext(S.seed, S.scanNonce)));
+    } finally {
+      if (!activeThumbOwner || S.fallbackThumbOwnerToken === activeThumbOwner || S.thumbTaskToken === activeThumbOwner) {
+        S.fallbackThumbRunning = false;
+        S.fallbackThumbRerunNeeded = false;
+      }
     }
   }
 
@@ -975,7 +1749,8 @@
   function shouldIgnoreRegion(region) {
     return /related-playlist|related-channel|mix-playlist|video-count|yt-pl-thumb|formatted-video-count-label|<b>\s*50\+?\s*<\/b>\s*videos|yt-badge-std[\s\S]{0,80}(?:PLAYLIST|Channel)|class=["'][^"']*related-channel/i.test(region);
   }
-  function parseSideResults2006Dec(source, ts, pageUrl) {
+  function parseSideResults2006Dec(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const sideStart = source.search(/<div\b[^>]*id=["']side_results["'][^>]*>/i);
     if (sideStart < 0) return [];
     const sideEnd = source.indexOf('</div>\n\n\t\t\t<table class="showingTable"', sideStart);
@@ -1036,7 +1811,7 @@
       out.push({
         id,
         title: cleanText(title),
-        uploader: cleanText(uploader),
+        uploader: cleanUploaderStat(uploader),
         duration: cleanText(duration),
         views: formatViews(rawViews),
         rawViews,
@@ -1050,7 +1825,8 @@
   }
 
 
-  function parseRelatedVidsBody2007Nov(source, ts, pageUrl) {
+  function parseRelatedVidsBody2007Nov(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const bodyStart = source.search(/<div\b[^>]*id=["']relatedVidsBody["'][^>]*>/i);
     if (bodyStart < 0) return [];
     const bodyEndMatch = source.slice(bodyStart).search(/<div\b[^>]*class=["'][^"']*alignC[^"']*padT5[^"']*padB10[^"']*bold[^"']*["'][^>]*>/i);
@@ -1124,7 +1900,8 @@
   }
 
 
-  function parseRelatedEntry2008Mar(source, ts, pageUrl) {
+  function parseRelatedEntry2008Mar(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const bodyStart = source.search(/<div\b[^>]*id=["']relatedVidsBody["'][^>]*>/i);
     if (bodyStart < 0) return [];
     const tail = source.slice(bodyStart);
@@ -1197,7 +1974,8 @@
     return out;
   }
 
-  function parseWatchDiscoverbox2008May(source, ts, pageUrl) {
+  function parseWatchDiscoverbox2008May(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const bodyStart = source.search(/<div\b[^>]*id=["']watch-related-vids-body["'][^>]*>/i);
     if (bodyStart < 0) return [];
     const tail = source.slice(bodyStart);
@@ -1269,7 +2047,8 @@
     return out;
   }
 
-  function parseVideoEntry2008DecMiniList(source, ts, pageUrl) {
+  function parseVideoEntry2008DecMiniList(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     // Desktop watch-discoverbox mini-list used around late 2008 through 2009.
     // Detect by structure, not by year, because Wayback rows and pasted cache snippets
     // can carry nearby timestamps while still using this same desktop layout.
@@ -1374,7 +2153,8 @@
     return -1;
   }
 
-  function parseWatchRelatedVideoList2010(source, ts, pageUrl) {
+  function parseWatchRelatedVideoList2010(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const ulOpen = source.match(/<ul\b[^>]*id=["']watch-related["'][^>]*>/i);
     if (!ulOpen) return [];
     const bodyStart = ulOpen.index;
@@ -1397,6 +2177,7 @@
       // Non-video rows in 2012-2013 watch-related can still be <li class="video-list-item">.
       // Keep real related-video rows, but ignore channels, playlists, "load more", and UI-only rows.
       if (/\bvideo-list-item-channel\b/i.test(liOpenTag) || /\brelated-channel\b|\brelated-playlist\b|\bwatch-more-related\b|\bvideo-count\b|\byt-pl-thumb\b/i.test(block)) continue;
+      if (/<span\b[^>]*class=["'][^"']*\byt-badge-std\b[^"']*["'][^>]*>\s*PLAYLIST\s*<\/span>/i.test(block)) continue;
       if (!/\brelated-video\b|\bvideo-list-item-link\b|\bcontent-link\b|\bthumb-link\b/i.test(block)) continue;
 
       const dataVideoId = firstMatch([
@@ -1415,7 +2196,9 @@
       if (!id) continue;
 
       let title = '';
-      const titleTag = firstMatch([/(<span\b[^>]*class=["'][^"']*\btitle\b[^"']*["'][^>]*>)/i], block);
+      // Keep this tag raw. Decoding &quot; before reading the attribute truncates titles at the first quote.
+      const titleTagMatch = String(block || '').match(/(<span\b[^>]*class=["'][^"']*\btitle\b[^"']*["'][^>]*>)/i);
+      const titleTag = titleTagMatch ? titleTagMatch[1] : '';
       if (titleTag) title = attrFromTag(titleTag, 'title');
       if (!title) title = stripTags(firstMatch([
         /<span\b[^>]*class=["'][^"']*\btitle\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i,
@@ -1430,6 +2213,10 @@
         /<span\b[^>]*class=["'][^"']*\bvideo-time\b[^"']*["'][^>]*>\s*([0-9]+[:.：﹕꞉][0-9]{2}(?:[:.：﹕꞉][0-9]{2})?)\s*<\/span>/i,
         /<span\b[^>]*class=["'][^"']*\baccessible-description\b[^"']*["'][^>]*>[\s\S]*?(?:Duration|Durée|Dauer|Duración|Durata)\s*(?:&nbsp;|\s)*[:：]\s*([0-9]+[:.：﹕꞉][0-9]{2}(?:[:.：﹕꞉][0-9]{2})?)/i
       ], block));
+      if (!duration) {
+        const vt = String(block || '').match(/<span\b[^>]*class=["'][^"']*\bvideo-time\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+        if (vt) duration = cleanDurationWords(stripTags(vt[1] || ''));
+      }
       if (isLive) duration = '';
 
       let pageThumb = '';
@@ -1456,12 +2243,24 @@
         statMatches.push({ index: statMatches.length, classAttr: sm[2] || '', html: sm[3] || '', text: stripTags(sm[3] || ''), usedAsUploader: false });
       }
 
+      const is2010StatOrder = timestampYear(ts) < 2012 && statMatches.length >= 2;
       let uploader = cleanUploaderStat(extractYtUserName(block)) || extractWatchRelatedUploaderFromBlock(block);
       let uploaderStatIndex = -1;
+      if (!uploader && is2010StatOrder) {
+        // 2010 watch-related rows use stable field order:
+        //   stat[0] = views, stat[1] = uploader.
+        // Keep this structural so localized view words and numeric uploader names do not matter.
+        uploader = cleanUploaderStat(statMatches[1].text);
+        if (uploader) {
+          uploaderStatIndex = statMatches[1].index;
+          statMatches[1].usedAsUploader = true;
+        }
+      }
       if (!uploader) {
         for (const s of statMatches) {
           const normalized = cleanText(s.text).replace(/ /g, ' ');
           if (!normalized) continue;
+          if (is2010StatOrder && s.index === 0) continue;
           if (/\balt\b|\bbadge\b|\bview-count\b/i.test(s.classAttr)) continue;
           if (/\byt-badge-std\b|\byt-badge\b/i.test(s.html)) continue;
           if (isFeaturedStatText(normalized) || isVideoCountText(normalized) || isExplicitLocalizedViewText(normalized)) continue;
@@ -1475,6 +2274,9 @@
       }
       let rawViews = '';
       let viewCountUnavailableReason = isMovie ? 'movie' : '';
+      if (is2010StatOrder) {
+        rawViews = parseStructuredViewStatNumber(statMatches[0].text) || '';
+      }
 
       // 2013/2014 structure:
       //   <span class="stat attribution">Creator</span>
@@ -1498,6 +2300,7 @@
 
       if (!rawViews) {
         for (const s of statMatches) {
+          if (is2010StatOrder && s.index !== 0) continue;
           if (/\byt-user-name\b/i.test(s.html)) continue;
           if (/\balt\b|\bbadge\b/i.test(s.classAttr) || /\byt-badge-std\b|\byt-badge\b/i.test(s.html)) continue;
           if (/\battribution\b/i.test(s.classAttr) && !/\bview-count\b/i.test(s.classAttr)) continue;
@@ -1507,6 +2310,7 @@
       }
       if (!rawViews) {
         for (const s of statMatches) {
+          if (is2010StatOrder && s.index !== 0) continue;
           if (s.usedAsUploader || s.index === uploaderStatIndex) continue;
           const parsedViews = parseLocalizedViewCount(s.text);
           if (parsedViews) { rawViews = parsedViews; break; }
@@ -1556,7 +2360,8 @@
 
 
 
-  function parseWatch7SidebarModules2015(source, ts, pageUrl) {
+  function parseWatch7SidebarModules2015(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     let bodyStart = -1;
     let bodyHtml = '';
     const sidebarOpen = source.match(/<div\b[^>]*id=["']watch7-sidebar-modules["'][^>]*>/i);
@@ -1594,7 +2399,8 @@
     return items;
   }
 
-  function parseWatchRevealRelatedComment2014(source, ts, pageUrl) {
+  function parseWatchRevealRelatedComment2014(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const revealOpen = source.search(/<div\b[^>]*id=["']watch-reveal-related["'][^>]*>/i);
     if (revealOpen < 0) return [];
     const commentStart = source.indexOf('<!--', revealOpen);
@@ -1690,21 +2496,54 @@
     };
   }
 
-  function parseFlashRvsSuggestions(source, ts, pageUrl) {
+  function extractJsStringProperty(source, propName) {
+    const re = new RegExp("[\"']" + propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + "[\"']\\s*:\\s*([\"'])", 'i');
+    const m = re.exec(String(source || ''));
+    if (!m) return null;
+    const quote = m[1];
+    let out = '';
+    let escaped = false;
+    for (let i = m.index + m[0].length; i < source.length; i++) {
+      const ch = source[i];
+      if (escaped) { out += '\\' + ch; escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === quote) return out;
+      out += ch;
+    }
+    return null;
+  }
+
+  function parseFlashRvsSuggestions(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const decodedSource = htmlDecodeDeep(decodeJsEscapes(source));
-    const idx = decodedSource.indexOf('rvs=');
-    if (idx < 0) return [];
-    let end = decodedSource.search(/&(?:endscreen_module|iv_queue_log_level|referrer|video_id|sendtmp|sk|timestamp|t)=/i);
-    if (end <= idx) end = decodedSource.indexOf('&', idx + 4);
-    if (end < 0) end = Math.min(decodedSource.length, idx + 250000);
-    const rawRvs = decodedSource.slice(idx + 4, end);
-    if (!rawRvs || !/(?:^|%26)id%3D[A-Za-z0-9_-]{11}/i.test(rawRvs)) return [];
+    let rawRvs = '';
+    let snippet = '';
+
+    // 2013 watch7 pages can keep related-video views only inside
+    // ytplayer.config.args.rvs: "id=...&view_count=...", while the visible
+    // related <li> row has no .view-count span. Read this as a secondary
+    // metadata source and merge it into DOM-parsed rows by video ID.
+    const jsonRvs = extractJsStringProperty(source, 'rvs');
+    if (jsonRvs && /(?:^|(?:%26|&))id(?:%3D|=)[A-Za-z0-9_-]{11}/i.test(decodeJsEscapes(jsonRvs))) {
+      rawRvs = htmlDecodeDeep(decodeJsEscapes(jsonRvs));
+      const propIdx = source.indexOf(jsonRvs);
+      snippet = source.slice(Math.max(0, propIdx - 600), Math.min(source.length, propIdx + 7000));
+    } else {
+      const idx = decodedSource.indexOf('rvs=');
+      if (idx < 0) return [];
+      let end = decodedSource.search(/&(?:endscreen_module|iv_queue_log_level|referrer|video_id|sendtmp|sk|timestamp|t)=/i);
+      if (end <= idx) end = decodedSource.indexOf('&', idx + 4);
+      if (end < 0) end = Math.min(decodedSource.length, idx + 250000);
+      rawRvs = decodedSource.slice(idx + 4, end);
+      snippet = decodedSource.slice(Math.max(0, idx - 600), Math.min(decodedSource.length, idx + 7000));
+    }
+
+    if (!rawRvs || !/(?:^|(?:%26|&))id(?:%3D|=)[A-Za-z0-9_-]{11}/i.test(rawRvs)) return [];
     const entries = rawRvs
-      .split(/%2C(?=(?:view_count|feature_type|author|title|length_seconds|featured|id)%3D)/i)
+      .split(/(?:%2C|,)(?=(?:view_count|feature_type|author|title|length_seconds|featured|id)(?:%3D|=))/i)
       .filter(Boolean);
     const out = [];
     const seen = new Set();
-    const snippet = decodedSource.slice(Math.max(0, idx - 600), Math.min(decodedSource.length, idx + 7000));
     for (const entry of entries) {
       const item = parseRvsEntry(entry, ts, pageUrl, snippet);
       if (!item || seen.has(item.id)) continue;
@@ -1784,7 +2623,7 @@
         const brace = source.indexOf('{', re.lastIndex);
         if (brace < 0) continue;
         const json = extractJsonObjectAfter(source, brace);
-        if (json && /compactVideoRenderer|secondaryResults|twoColumnWatchNextResults/i.test(json)) return json;
+        if (json && /compactVideoRenderer|secondaryResults|twoColumnWatchNextResults|lockupViewModel|shortsLockupViewModel/i.test(json)) return json;
       }
     }
     return '';
@@ -2291,7 +3130,218 @@
     return out;
   }
 
+  function getYtInitialDataObject(source) {
+    const json = extractYtInitialDataJson(source);
+    if (!json) return null;
+    try { return JSON.parse(json); }
+    catch (_) {
+      try { return JSON.parse(decodeJsEscapes(json)); }
+      catch (__) { return null; }
+    }
+  }
 
+  function viewModelText(node) {
+    if (!node) return '';
+    if (typeof node === 'string') return cleanText(htmlDecodeDeep(decodeJsEscapes(node)));
+    if (node.content) return cleanText(htmlDecodeDeep(decodeJsEscapes(node.content)));
+    return ytText(node);
+  }
+
+  function viewModelBestImageUrl(sources, id, ts) {
+    if (!Array.isArray(sources) || !sources.length) return '';
+    const idEsc = id ? String(id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : '';
+    const valid = sources.filter(x => x && x.url).map(x => ({
+      url: htmlDecodeDeep(decodeJsEscapes(x.url || '')).trim(),
+      area: (Number(x.width) || 0) * (Number(x.height) || 0)
+    })).filter(x => x.url);
+    if (!valid.length) return '';
+    let chosen = valid.find(x => id && new RegExp('/vi(?:_webp)?/' + idEsc + '/', 'i').test(x.url));
+    if (!chosen) chosen = valid.slice().sort((a, b) => b.area - a.area)[0] || valid[0];
+    return normalizeUrl(chosen.url, ts);
+  }
+
+  function viewModelFirstImageUrl(node, id, ts) {
+    if (!node || typeof node !== 'object') return '';
+    if (node.image && Array.isArray(node.image.sources)) return viewModelBestImageUrl(node.image.sources, id, ts);
+    if (Array.isArray(node.sources)) return viewModelBestImageUrl(node.sources, id, ts);
+    if (node.thumbnail && Array.isArray(node.thumbnail.thumbnails)) return viewModelBestImageUrl(node.thumbnail.thumbnails, id, ts);
+    if (node.thumbnail && Array.isArray(node.thumbnail.sources)) return viewModelBestImageUrl(node.thumbnail.sources, id, ts);
+    if (node.thumbnails) return viewModelBestImageUrl(node.thumbnails, id, ts);
+    return '';
+  }
+
+  function lockupViewModelMetadataRows(vm) {
+    const meta = vm && vm.metadata && vm.metadata.lockupMetadataViewModel;
+    const rows = meta && meta.metadata && meta.metadata.contentMetadataViewModel && meta.metadata.contentMetadataViewModel.metadataRows;
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  function metadataPartText(part) {
+    if (!part) return '';
+    if (part.text) return viewModelText(part.text);
+    if (part.textContent) return viewModelText(part.textContent);
+    return viewModelText(part);
+  }
+
+  function metadataRowPartsText(row) {
+    const parts = row && Array.isArray(row.metadataParts) ? row.metadataParts : [];
+    return parts.map(metadataPartText).filter(Boolean);
+  }
+
+  function lockupViewModelDuration(vm) {
+    const overlays = vm && vm.contentImage && vm.contentImage.thumbnailViewModel && vm.contentImage.thumbnailViewModel.overlays;
+    if (Array.isArray(overlays)) {
+      for (const o of overlays) {
+        const badges = o && o.thumbnailOverlayBadgeViewModel && o.thumbnailOverlayBadgeViewModel.thumbnailBadges;
+        if (!Array.isArray(badges)) continue;
+        for (const b of badges) {
+          const text = b && b.thumbnailBadgeViewModel && b.thumbnailBadgeViewModel.text;
+          const dur = cleanDurationWords(text || '');
+          if (dur) return dur;
+        }
+      }
+    }
+    const label = vm && vm.rendererContext && vm.rendererContext.accessibilityContext && vm.rendererContext.accessibilityContext.label;
+    const durFromLabel = cleanDurationWords(label || '');
+    return durFromLabel || '';
+  }
+
+  function parseYtInitialDataLockupViewModels2025(source, ts, pageUrl) {
+    if (!/ytInitialData|lockupViewModel|shortsLockupViewModel/i.test(source)) return [];
+    const data = getYtInitialDataObject(source);
+    if (!data) return [];
+
+    const out = [];
+    const seen = new Set();
+    let normalCandidates = 0;
+    let shortsCandidates = 0;
+    let playlistsSkipped = 0;
+
+    function addNormal(vm) {
+      if (!vm || typeof vm !== 'object') return;
+      if (vm.contentType && vm.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO') { playlistsSkipped++; return; }
+      const id = vm.contentId || (vm.rendererContext && vm.rendererContext.commandContext && vm.rendererContext.commandContext.onTap && vm.rendererContext.commandContext.onTap.innertubeCommand && vm.rendererContext.commandContext.onTap.innertubeCommand.watchEndpoint && vm.rendererContext.commandContext.onTap.innertubeCommand.watchEndpoint.videoId) || '';
+      if (!isValidVideoId(id) || seen.has(id)) return;
+      normalCandidates++;
+
+      const meta = vm.metadata && vm.metadata.lockupMetadataViewModel;
+      const title = viewModelText(meta && meta.title);
+      const rows = lockupViewModelMetadataRows(vm);
+      const row0 = metadataRowPartsText(rows[0]);
+      const row1 = metadataRowPartsText(rows[1]);
+      const uploader = cleanUploaderStat(row0[0] || '');
+      let rawViews = '';
+      let ageText = '';
+      for (const t of row1) {
+        if (!rawViews) rawViews = parseLocalizedViewCount(t) || (/\bwatching\b/i.test(t) ? parseStructuredViewStatNumber(t) : '');
+        if (!ageText && /\b(?:ago|year|month|week|day|hour|minute|second)s?\b/i.test(t)) ageText = cleanText(t);
+      }
+      if (!rawViews) {
+        const label = vm.rendererContext && vm.rendererContext.accessibilityContext && vm.rendererContext.accessibilityContext.label;
+        rawViews = parseLocalizedViewCount(label || '') || (/\bwatching\b/i.test(label || '') ? parseStructuredViewStatNumber(label || '') : '');
+      }
+
+      const isLive = row1.some(t => /\bwatching\b|\blive\b/i.test(t));
+      const duration = isLive ? '' : lockupViewModelDuration(vm);
+      const pageThumb = viewModelFirstImageUrl(vm.contentImage && vm.contentImage.thumbnailViewModel, id, ts) || makeTimestampDefaultThumb(id, ts);
+      const item = {
+        id,
+        title: cleanText(title),
+        uploader: cleanText(uploader),
+        duration: cleanText(duration),
+        isLive,
+        durationUnavailableReason: isLive ? 'live' : '',
+        views: formatViews(rawViews),
+        rawViews,
+        viewsUnavailableReason: rawViews ? '' : (row1.join(' · ') || ''),
+        uploadAge: ageText,
+        pageThumb,
+        parser: 'ytInitialData-lockupViewModel-video-2025',
+        timestamp: ts,
+        captureUrl: pageUrl,
+        parseDebug: {
+          snippetNote: 'Parsed from 2025+ ytInitialData lockupViewModel video JSON. Older parsers are untouched.',
+          ytInitialDataLockupViewModel: true,
+          type: 'video',
+          row0,
+          row1,
+          snippet: compactSnippet(JSON.stringify(vm).slice(0, 8000), 6000)
+        }
+      };
+      if (!item.title && !item.pageThumb) return;
+      seen.add(id);
+      out.push(item);
+    }
+
+    function addShort(vm) {
+      if (!vm || typeof vm !== 'object') return;
+      const cmd = vm.onTap && vm.onTap.innertubeCommand;
+      const endpoint = cmd && cmd.reelWatchEndpoint;
+      const id = (endpoint && endpoint.videoId) || (vm.entityId && String(vm.entityId).match(/shorts-shelf-item-([A-Za-z0-9_-]{11})/) || [])[1] || '';
+      if (!isValidVideoId(id) || seen.has(id)) return;
+      shortsCandidates++;
+      const overlay = vm.overlayMetadata || {};
+      let title = viewModelText(overlay.primaryText);
+      let rawViews = parseLocalizedViewCount(viewModelText(overlay.secondaryText));
+      if (!title || !rawViews) {
+        const a11y = cleanText(vm.accessibilityText || '');
+        if (!title) title = a11y.replace(/,\s*[^,]*\bviews?\s*-\s*play Short\s*$/i, '').replace(/\s*-\s*play Short\s*$/i, '');
+        if (!rawViews) rawViews = parseLocalizedViewCount(a11y);
+      }
+      const shelfThumb = viewModelFirstImageUrl(vm.thumbnail, id, ts);
+      const frameThumb = viewModelFirstImageUrl(endpoint && endpoint.thumbnail, id, ts);
+      const pageThumb = shelfThumb || frameThumb || makeTimestampDefaultThumb(id, ts);
+      const item = {
+        id,
+        title: cleanText(title),
+        uploader: '[None]',
+        duration: '[None]',
+        durationUnavailableReason: 'shorts',
+        views: formatViews(rawViews),
+        rawViews,
+        viewsUnavailableReason: rawViews ? '' : viewModelText(overlay.secondaryText),
+        pageThumb,
+        isShort: true,
+        parser: 'ytInitialData-shortsLockupViewModel-2025',
+        timestamp: ts,
+        captureUrl: pageUrl,
+        parseDebug: {
+          snippetNote: 'Parsed from 2025+ ytInitialData shortsLockupViewModel JSON. Shorts usually include title/views/thumbnails but not uploader/duration in this shelf model.',
+          ytInitialDataShortsLockupViewModel: true,
+          type: 'shorts',
+          shelfThumb,
+          frameThumb,
+          snippet: compactSnippet(JSON.stringify(vm).slice(0, 8000), 6000)
+        }
+      };
+      if (!item.title && !item.pageThumb) return;
+      seen.add(id);
+      out.push(item);
+    }
+
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (node.lockupViewModel) addNormal(node.lockupViewModel);
+      if (node.shortsLockupViewModel) addShort(node.shortsLockupViewModel);
+      if (Array.isArray(node)) {
+        for (const v of node) walk(v);
+      } else {
+        for (const k of Object.keys(node)) walk(node[k]);
+      }
+    }
+    walk(data);
+
+    if (settings().debug && (/lockupViewModel|shortsLockupViewModel/i.test(source))) {
+      log('parser-candidate', `Modern lockup parser: ${out.length} parsed (${normalCandidates} video, ${shortsCandidates} shorts, ${playlistsSkipped} playlist/non-video skipped)`, {
+        parser: 'ytInitialData-lockupViewModel-2025',
+        parsed: out.length,
+        videoCandidates: normalCandidates,
+        shortsCandidates,
+        playlistsSkipped
+      });
+    }
+    return out;
+  }
 
 
 
@@ -2384,6 +3434,104 @@
     return candidates[candidates.length - 1] || raw;
   }
 
+
+  function unescapeLegacyWatchHtml(value) {
+    return htmlDecodeDeep(decodeJsEscapes(String(value || ''))
+      .replace(/\\\//g, '/')
+      .replace(/\\"/g, '"')
+      .replace(/\\'/g, "'"));
+  }
+
+  function findBalancedJsonEnd(text, startIndex) {
+    const raw = String(text || '');
+    const start = Math.max(0, Number(startIndex) || 0);
+    const opener = raw[start];
+    const closer = opener === '[' ? ']' : (opener === '{' ? '}' : '');
+    if (!closer) return -1;
+    let depth = 0;
+    let inString = false;
+    let esc = false;
+    for (let i = start; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inString) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === opener) depth++;
+      else if (ch === closer) {
+        depth--;
+        if (depth === 0) return i + 1;
+      }
+    }
+    return -1;
+  }
+
+  function collectHtmlStringsFromJson(value, out, keyName) {
+    if (!value || !out) return;
+    if (typeof value === 'string') {
+      const raw = value;
+      const key = String(keyName || '').toLowerCase();
+      if ((/<[a-z][\s\S]*>/i.test(raw) || /\\u003c|&lt;|<li\b|video-list-item|watch7-sidebar-modules|watch-related/i.test(raw)) &&
+          (!key || /^(?:content|html|body|header|head|footer|foot|sidebar|watch_html|watch|data)$/i.test(key) || /content|html|body|head|sidebar|watch/i.test(key))) {
+        out.push(unescapeLegacyWatchHtml(raw));
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const v of value) collectHtmlStringsFromJson(v, out, keyName);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const [k, v] of Object.entries(value)) collectHtmlStringsFromJson(v, out, k);
+    }
+  }
+
+  function extractSpfHtmlPayloads(source) {
+    const raw0 = String(source || '');
+    const raw = raw0.includes('--- HTML ---') ? raw0.slice(raw0.indexOf('--- HTML ---') + '--- HTML ---'.length).trim() : raw0.trim();
+    const start = raw.search(/[\[{]/);
+    if (start < 0) return '';
+    const end = findBalancedJsonEnd(raw, start);
+    if (end <= start) return '';
+    const jsonText = raw.slice(start, end);
+    try {
+      const parsed = JSON.parse(jsonText);
+      const parts = [];
+      collectHtmlStringsFromJson(parsed, parts, '');
+      return parts.join('\n');
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function materializeLegacyWatchSource(source) {
+    const raw = String(source || '');
+    const spf = extractSpfHtmlPayloads(raw);
+    const candidates = [
+      raw,
+      spf,
+      unescapeLegacyWatchHtml(raw),
+      unescapeLegacyWatchHtml(spf),
+      htmlDecodeDeep(raw),
+      htmlDecodeDeep(decodeJsEscapes(raw)),
+      decodeJsEscapes(htmlDecodeDeep(raw))
+    ].filter(Boolean);
+    let best = candidates[0] || raw;
+    let bestScore = -1;
+    for (const c of candidates) {
+      const score = countMatches(c, /\bvideo-list-item\b/gi) * 5
+        + countMatches(c, /\bwatch7-sidebar-modules\b/gi) * 20
+        + countMatches(c, /\bwatch-related\b/gi) * 10
+        + countMatches(c, /\bcontent-link\b|\bthumb-link\b|\brelated-video\b/gi) * 3
+        + countMatches(c, /<li\b/gi);
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    return best || raw;
+  }
+
   function ytLockupMarkerStats(source) {
     const raw = String(source || '');
     const mat = materializeYtLockupSource(raw);
@@ -2413,6 +3561,355 @@
 
 
 
+
+  function buildCdxThumbUrl(id, host) {
+    return `https://web.archive.org/cdx/search/cdx?url=${host}/vi/${encodeURIComponent(id)}&matchType=prefix&filter=statuscode:200&collapse=digest`;
+  }
+  function cdxThumbPreviewUrl(row) {
+    if (!row || !row.timestamp || !row.original) return '';
+    return `https://web.archive.org/web/${row.timestamp}im_/${row.original}`;
+  }
+  function chooseLargestCdxThumbRow(rows, id) {
+    const vid = String(id || '');
+    let best = null;
+    for (const row of rows || []) {
+      if (!row || String(row.statuscode) !== '200') continue;
+      if (vid && !String(row.original || '').includes(`/vi/${vid}`)) continue;
+      const len = Number(String(row.length || '').replace(/[^0-9]/g, '')) || 0;
+      if (!best || len > best._len) best = Object.assign({}, row, { _len: len });
+    }
+    return best;
+  }
+  function cdxThumbCacheKey(id) { return `cdxthumb:${id || ''}`; }
+  function cdxThumbFound(video) {
+    return !!(video && video.cdxThumb && video.cdxThumb.status === 'found' && video.cdxThumb.previewUrl);
+  }
+  function applyCdxThumbPreview(video, opts) {
+    opts = opts || {};
+    if (!cdxThumbFound(video)) return false;
+    // Automatic CDX is no longer a fallback-thumb upgrader. If fallback already
+    // found a page/timestamp thumb, only a manual CDX Thumb click may replace it.
+    if (!opts.manual && opts.leftoversOnly && fallbackThumbIsLoaded(video) && !cdxThumbIsManual(video)) return false;
+    video.displayThumb = video.cdxThumb.previewUrl;
+    video.thumbnailStatus = 'CDX thumb';
+    video.thumbnailReason = `largest CDX thumbnail length ${video.cdxThumb.length || '?'}`;
+    video.usedPreviewThumb = 'CDX thumb';
+    return true;
+  }
+  function refreshVideoPreview(video, opts) {
+    if (!video) return;
+    if (cdxThumbFound(video)) {
+      applyCdxThumbPreview(video, opts || {});
+    }
+  }
+  function cdxThumbIsRetryable(cached) {
+    const s = String(cached && cached.status || '').toLowerCase();
+    const reason = String(cached && cached.reason || '').toLowerCase();
+    const http = Number(cached && (cached.httpStatus || cached.statusCode || cached.http));
+    return s === 'retry' || http === -1 || http === 429 || http >= 500 || /(?:^|\b)(?:429|5\d\d|-1)(?:\b|$)|timeout|rate.?limit|temporar|network/.test(reason);
+  }
+  function cdxThumbIsTerminal(cached) {
+    const s = String(cached && cached.status || '').toLowerCase();
+    if (cdxThumbIsRetryable(cached)) return false;
+    return s === 'found' || s === 'failed' || s === 'none';
+  }
+  async function fetchCdxThumbRowsForHost(id, host, ctx) {
+    const cdxUrl = buildCdxThumbUrl(id, host);
+    if (!isRunContextCurrent(ctx)) return { ok: false, status: -2, cdxUrl, rows: [], rawText: '', rawBytes: 0, error: 'stale CDX thumbnail check' };
+    log('cdx-thumb', `checking CDX thumb ${id} on ${host}`, { cdxUrl, videoId: id });
+    const res = await request({ url: cdxUrl, timeout: 60000, cancelCheck: () => !isRunContextCurrent(ctx) });
+    if (!isRunContextCurrent(ctx) || res.status === -2) return { ok: false, status: -2, cdxUrl, rows: [], rawText: '', rawBytes: 0, error: 'stale CDX thumbnail check' };
+    const rawText = String(res && res.text || '');
+    if (!res.ok) return { ok: false, status: res.status, cdxUrl, rows: [], rawText, rawBytes: rawText.length, error: res.error || `HTTP ${res.status}` };
+    return { ok: true, status: res.status, cdxUrl, rows: parsePlainCdx(rawText), rawText, rawBytes: rawText.length };
+  }
+  async function checkCdxThumb(video, opts) {
+    opts = opts || {};
+    const ctx = opts.ctx || null;
+    if (opts.auto && (!settings().autoCdxThumbnails || !isRunContextCurrent(ctx))) return null;
+    if (!video || !video.id) return null;
+    if (opts.manual && (S.cdxThumbQueued.has(video.id) || S.cdxThumbActive.has(video.id))) {
+      S.cdxThumbManualRequested.add(video.id);
+      if (/^CDX queued|Checking CDX thumb$/i.test(String(video.thumbnailStatus || ''))) video.thumbnailReason = 'manual CDX requested; waiting for current CDX work';
+      renderVideoList();
+      return { status: 'already-running', videoId: video.id, reason: 'manual CDX attached to current CDX work' };
+    }
+    if (opts.manual) S.cdxThumbManualRequested.add(video.id);
+    if (String(video.videoStatus || '').toLowerCase() === 'available') {
+      log('cdx-thumb-skip', `${video.id}: skipped CDX thumb because live video is Available`, { videoId: video.id });
+      return null;
+    }
+    applyCachedThumbState(video);
+    if (opts.auto && opts.leftoversOnly && fallbackThumbIsLoaded(video)) {
+      clearCdxCheckingState(video, video.thumbnailStatus, video.thumbnailReason || 'fallback thumb already found');
+      return { status: 'skipped', videoId: video.id, reason: 'fallback thumb already found' };
+    }
+    const manualRequestedEarly = !!opts.manual || (S.cdxThumbManualRequested && S.cdxThumbManualRequested.has(video.id));
+    const cached = getStore(cdxThumbCacheKey(video.id), null);
+    if (cached && cached.status && !cdxThumbIsRetryable(cached)) {
+      video.cdxThumb = cached;
+      if (manualRequestedEarly && cdxThumbFound(video)) video.cdxThumb.manual = true;
+      if (cdxThumbFound(video)) applyCdxThumbPreview(video, { manual: manualRequestedEarly, leftoversOnly: !!opts.leftoversOnly });
+      else clearCdxCheckingState(video, cached.status === 'failed' ? 'CDX no results' : 'CDX failed', cached.reason || 'CDX thumbnail check finished');
+      saveThumbState(video);
+      renderVideoList();
+      log('cdx-thumb-cache', `${video.id}: ${cached.status}${cached.length ? ` length ${cached.length}` : ''}${cached.reason ? ` — ${cached.reason}` : ''}`, cached.previewUrl ? { thumbLinks: [{ label: 'CDX thumb ↗', url: cached.previewUrl }], videoId: video.id, reason: cached.reason || '' } : { videoId: video.id, reason: cached.reason || '' });
+      if (S.cdxThumbManualRequested) S.cdxThumbManualRequested.delete(video.id);
+      return cached;
+    }
+    if (cached && cdxThumbIsRetryable(cached)) {
+      log('cdx-thumb-retry', `${video.id}: retrying cached CDX failure — ${cached.reason || cached.status || 'retry-needed'}`, { videoId: video.id, reason: cached.reason || '', httpStatus: cached.httpStatus || cached.statusCode || '' });
+    }
+    video.cdxThumb = { status: 'checking', checkedAt: Date.now() };
+    if (!cdxThumbFound(video) && !/^(Fallback queued|Checking page thumb|Checking timestamp thumb)$/i.test(String(video.thumbnailStatus || ''))) {
+      video.thumbnailStatus = 'Checking CDX thumb';
+      video.thumbnailReason = 'querying CDX thumbnail captures';
+    }
+    renderVideoList();
+    if (opts.auto && (!settings().autoCdxThumbnails || !isRunContextCurrent(ctx))) return null;
+    const used = await fetchCdxThumbRowsForHost(video.id, 'i.ytimg.com', ctx);
+    if (opts.auto && (!settings().autoCdxThumbnails || !isRunContextCurrent(ctx) || (used && used.status === -2))) return null;
+    const manualRequested = !!opts.manual || (S.cdxThumbManualRequested && S.cdxThumbManualRequested.has(video.id));
+    let best = used.ok ? chooseLargestCdxThumbRow(used.rows, video.id) : null;
+    let out;
+    if (best) {
+      const previewUrl = cdxThumbPreviewUrl(best);
+      out = { status: 'found', videoId: video.id, timestamp: best.timestamp, original: best.original, mimetype: best.mimetype || '', digest: best.digest || '', length: String(best.length || best._len || ''), previewUrl, cdxUrl: used.cdxUrl || '', checkedAt: Date.now(), manual: manualRequested, auto: !!opts.auto };
+      video.cdxThumb = out;
+      if (!applyCdxThumbPreview(video, { manual: manualRequested, leftoversOnly: !!opts.leftoversOnly })) {
+        clearCdxCheckingState(video, fallbackThumbIsLoaded(video) ? video.thumbnailStatus : 'CDX thumb found', fallbackThumbIsLoaded(video) ? video.thumbnailReason : `largest CDX thumbnail length ${out.length || '?'}`);
+      }
+      throttleSuccess('cdx');
+      setStore(cdxThumbCacheKey(video.id), out);
+      saveThumbState(video);
+      log('cdx-thumb-done', `${video.id}: found largest CDX thumb length ${out.length}`, { cdxUrl: out.cdxUrl, thumbLinks: [{ label: 'CDX thumb ↗', url: out.previewUrl }], videoId: video.id, length: out.length, timestamp: out.timestamp, original: out.original });
+    } else {
+      const httpStatus = used && typeof used.status !== 'undefined' ? Number(used.status) : -1;
+      const retry = !used.ok && (httpStatus === -1 || httpStatus === 429 || httpStatus >= 500);
+      let noRowsReason = 'no CDX thumbnail results';
+      if (used && used.ok) {
+        const raw = String(used.rawText || '').trim();
+        if (!raw) noRowsReason = 'no CDX thumbnail results: empty response';
+        else if (raw === '[]') noRowsReason = 'no CDX thumbnail results: []';
+      }
+      out = { status: retry ? 'retry' : 'failed', videoId: video.id, httpStatus, reason: used && used.ok ? noRowsReason : `CDX HTTP ${Number.isFinite(httpStatus) ? httpStatus : 'error'}`, cdxUrl: used && used.cdxUrl || buildCdxThumbUrl(video.id, 'i.ytimg.com'), checkedAt: Date.now() };
+      video.cdxThumb = out;
+      if (retry) {
+        if (!/^(Fallback queued|Checking page thumb|Checking timestamp thumb|Fallback page thumb|Fallback timestamp thumb)$/i.test(String(video.thumbnailStatus || ''))) {
+          video.thumbnailStatus = 'CDX retry-needed';
+          video.thumbnailReason = out.reason;
+        }
+        throttleFail('cdx');
+      } else {
+        if (!/^(Fallback queued|Checking page thumb|Checking timestamp thumb|Fallback page thumb|Fallback timestamp thumb)$/i.test(String(video.thumbnailStatus || ''))) {
+          video.thumbnailStatus = 'CDX no results';
+          video.thumbnailReason = out.reason;
+        }
+        throttleSuccess('cdx');
+      }
+      setStore(cdxThumbCacheKey(video.id), out);
+      saveThumbState(video);
+      log(retry ? 'cdx-thumb-retry' : 'cdx-thumb-failed', `${video.id}: ${out.reason}`, { cdxUrl: out.cdxUrl, videoId: video.id });
+    }
+    if (S.cdxThumbManualRequested) S.cdxThumbManualRequested.delete(video.id);
+    renderVideoList();
+    return out;
+  }
+  function clearCdxCheckingState(video, status, reason) {
+    if (!video) return;
+    const cur = String(video.thumbnailStatus || '');
+    const cdxStatus = String(video.cdxThumb && video.cdxThumb.status || '').toLowerCase();
+    if (/checking cdx thumb|cdx queued/i.test(cur) || cdxStatus === 'checking') {
+      video.thumbnailStatus = status || 'CDX unchecked';
+      video.thumbnailReason = reason || 'CDX thumbnail check ended';
+      if (!cdxThumbFound(video)) {
+        refreshVideoPreview(video);
+        video.displayThumb = video.displayThumb || makeDirectThumb(video.id);
+        if (!video.usedPreviewThumb || /cdx/i.test(String(video.usedPreviewThumb))) video.usedPreviewThumb = 'live 0.jpg placeholder';
+      }
+    }
+  }
+
+  function resetCdxCheckingStatuses(reason) {
+    let changed = 0;
+    for (const video of S.videos.values()) {
+      if (!video) continue;
+      const wasChecking = /checking cdx thumb|cdx queued/i.test(String(video.thumbnailStatus || '')) || (video.cdxThumb && String(video.cdxThumb.status || '').toLowerCase() === 'checking');
+      if (!wasChecking) continue;
+      video.cdxThumb = video.cdxThumb && video.cdxThumb.status === 'checking' ? { status: 'unchecked', reason: reason || 'CDX queue cancelled', checkedAt: Date.now() } : video.cdxThumb;
+      clearCdxCheckingState(video, 'CDX unchecked', reason || 'CDX queue cancelled');
+      changed++;
+    }
+    if (changed) {
+      log('cdx-thumb-auto', `Reset ${changed} unfinished CDX thumbnail check(s)${reason ? ' — ' + reason : ''}`, { changed, reason: reason || '' });
+      renderVideoList();
+      renderStats();
+    }
+  }
+
+  function autoCdxLeftoversOnlyMode() {
+    const st = settings();
+    return !!(st.autoCdxThumbnails && st.fallbackThumbnails);
+  }
+
+  function autoCdxShouldCheckVideo(v, opts) {
+    opts = opts || {};
+    if (!v || !isValidVideoId(v.id)) return false;
+    if (String(v.videoStatus || '').toLowerCase() !== 'unavailable') return false;
+    if (cdxThumbIsManual(v)) return false;
+    if (cdxThumbFinalAutoState(v) || cdxThumbFound(v)) return false;
+    // Only when Auto Fallback and Auto CDX are both ON, Auto CDX is a
+    // fallback-of-fallback: it rescues fallback failures and does not upgrade
+    // successful page/timestamp fallback thumbnails. When Auto CDX is ON by
+    // itself, it checks all unavailable videos regardless of fallback state.
+    if (opts.leftoversOnly) {
+      if (fallbackThumbIsLoaded(v)) return false;
+      if (!fallbackThumbFailed(v)) return false;
+    }
+    return true;
+  }
+
+  function cdxThumbEligibleVideosFromCurrentResults(opts) {
+    opts = opts || {};
+    const out = [];
+    const seen = new Set();
+    for (const v of S.videos.values()) {
+      if (!v || !isValidVideoId(v.id) || seen.has(v.id)) continue;
+      seen.add(v.id);
+      if (!autoCdxShouldCheckVideo(v, opts)) continue;
+      if (S.cdxThumbQueued && S.cdxThumbQueued.has(v.id)) continue;
+      if (S.cdxThumbActive && S.cdxThumbActive.has(v.id)) continue;
+      const cached = getStore(cdxThumbCacheKey(v.id), null);
+      if (cached && cdxThumbIsTerminal(cached)) {
+        v.cdxThumb = cached;
+        if (cdxThumbFound(v)) applyCdxThumbPreview(v, { manual: cdxThumbIsManual(v), leftoversOnly: autoCdxLeftoversOnlyMode() });
+        else clearCdxCheckingState(v, cached.status === 'failed' ? 'CDX no results' : 'CDX failed', cached.reason || 'CDX thumbnail check finished');
+        continue;
+      }
+      if (v.cdxThumb && String(v.cdxThumb.status || '').toLowerCase() === 'checking') continue;
+      out.push(v);
+    }
+    return out;
+  }
+
+  function addToCdxThumbQueue(videos) {
+    let added = 0;
+    const retry = [];
+    const rest = [];
+    for (const v of videos || []) {
+      if (!v || !v.id) continue;
+      if (S.cdxThumbQueued.has(v.id) || S.cdxThumbActive.has(v.id)) continue;
+      const cached = getStore(cdxThumbCacheKey(v.id), null) || v.cdxThumb || null;
+      if (cdxThumbIsRetryable(cached)) retry.push(v); else rest.push(v);
+    }
+    for (const v of retry.concat(rest)) {
+      if (S.cdxThumbQueued.has(v.id) || S.cdxThumbActive.has(v.id)) continue;
+      S.cdxThumbQueue.push(v);
+      S.cdxThumbQueued.add(v.id);
+      if (!cdxThumbFound(v) && !/^(Fallback queued|Checking page thumb|Checking timestamp thumb)$/i.test(String(v.thumbnailStatus || ''))) {
+        v.thumbnailStatus = 'CDX queued';
+        v.thumbnailReason = 'waiting to query CDX thumbnail captures';
+      }
+      added++;
+    }
+    return added;
+  }
+
+  async function queueCdxThumbsForCurrentVideos(reason) {
+    if (!settings().autoCdxThumbnails) return;
+    const leftoversOnly = autoCdxLeftoversOnlyMode();
+    const initial = cdxThumbEligibleVideosFromCurrentResults({ leftoversOnly });
+    const added = addToCdxThumbQueue(initial);
+    const conc = concurrencySetting('cdx');
+    if (S.cdxThumbRunning) {
+      if (added) {
+        log('cdx-thumb-auto', `Auto CDX thumb appended ${added} new unavailable video(s)${reason ? ' — ' + reason : ''}`, { added, queued: S.cdxThumbQueue.length, active: S.cdxThumbActive.size, reason: reason || '', concurrency: conc, throttle: `${QUEUE_THROTTLES.cdx.level}/${QUEUE_THROTTLES.cdx.maxLevel}` });
+        renderVideoList();
+        renderStats();
+      }
+      return;
+    }
+    if (!S.cdxThumbQueue.length) {
+      if (reason === 'toggle ON') log('cdx-thumb-auto', 'Auto CDX thumb queue empty — no unchecked/retry-needed unavailable videos', { reason: reason || '' });
+      return;
+    }
+    const token = ++S.cdxThumbTaskToken;
+    const ctx = makeRunContext(S.seed, S.scanNonce);
+    S.cdxThumbRunning = true;
+    log('cdx-thumb-auto', `Auto CDX thumb queued ${S.cdxThumbQueue.length} unavailable video(s)${reason ? ' — ' + reason : ''}`, { count: S.cdxThumbQueue.length, reason: reason || '', concurrency: conc, throttle: `${QUEUE_THROTTLES.cdx.level}/${QUEUE_THROTTLES.cdx.maxLevel}` });
+    renderVideoList();
+    renderStats();
+    let done = 0;
+    async function worker(workerId) {
+      while (settings().autoCdxThumbnails && token === S.cdxThumbTaskToken && !S.stopped) {
+        while (S.paused && !S.stopped && token === S.cdxThumbTaskToken && settings().autoCdxThumbnails) await sleep(300);
+        if (!settings().autoCdxThumbnails || token !== S.cdxThumbTaskToken || S.stopped) break;
+        const video = S.cdxThumbQueue.shift();
+        if (!video) break;
+        S.cdxThumbQueued.delete(video.id);
+        if (!autoCdxShouldCheckVideo(video, { leftoversOnly })) {
+          const restoreStatus = fallbackThumbIsLoaded(video) ? video.thumbnailStatus : fallbackThumbFailed(video) ? 'Fallback failed' : 'Archived thumb not checked';
+          const restoreReason = fallbackThumbIsLoaded(video) ? video.thumbnailReason : fallbackThumbFailed(video) ? (video.fallbackThumbReason || 'fallback total failure') : 'not eligible for Auto CDX';
+          clearCdxCheckingState(video, restoreStatus, restoreReason);
+          saveThumbState(video);
+          renderVideoList();
+          renderStats();
+          continue;
+        }
+        S.cdxThumbActive.add(video.id);
+        const totalHint = done + S.cdxThumbQueue.length + S.cdxThumbActive.size;
+        try {
+          await queueDelay('cdx', 1, `${done + 1}/${totalHint || '?'} worker ${workerId}`);
+          if (!settings().autoCdxThumbnails || token !== S.cdxThumbTaskToken || S.stopped) break;
+          await checkCdxThumb(video, { auto: true, retry: true, leftoversOnly, ctx });
+        } catch (e) {
+          const reasonText = e && (e.message || e) ? String(e.message || e) : 'CDX thumbnail exception';
+          const out = { status: 'retry', videoId: video.id, httpStatus: -1, reason: reasonText, cdxUrl: buildCdxThumbUrl(video.id, 'i.ytimg.com'), checkedAt: Date.now() };
+          video.cdxThumb = out;
+          if (!/^(Fallback queued|Checking page thumb|Checking timestamp thumb|Fallback page thumb|Fallback timestamp thumb)$/i.test(String(video.thumbnailStatus || ''))) {
+            video.thumbnailStatus = 'CDX retry-needed';
+            video.thumbnailReason = reasonText;
+          }
+          setStore(cdxThumbCacheKey(video.id), out);
+          saveThumbState(video);
+          throttleFail('cdx');
+          log('cdx-thumb-retry', `${video.id}: ${reasonText}`, { cdxUrl: out.cdxUrl, videoId: video.id });
+        } finally {
+          S.cdxThumbActive.delete(video.id);
+          done++;
+          if (token === S.cdxThumbTaskToken && settings().autoCdxThumbnails && isRunContextCurrent(ctx)) {
+            if (done % 5 === 0 || !S.cdxThumbQueue.length) log('cdx-thumb-auto', `progress ${done}/${done + S.cdxThumbQueue.length + S.cdxThumbActive.size}`, { done, remaining: S.cdxThumbQueue.length, active: S.cdxThumbActive.size, concurrency: conc, throttle: `${QUEUE_THROTTLES.cdx.level}/${QUEUE_THROTTLES.cdx.maxLevel}` });
+            renderVideoList();
+            renderStats();
+          }
+        }
+      }
+    }
+    try {
+      await Promise.all(Array.from({ length: Math.min(conc, S.cdxThumbQueue.length || 1) }, (_, i) => worker(i + 1)));
+    } finally {
+      if (token === S.cdxThumbTaskToken) {
+        S.cdxThumbRunning = false;
+        if (settings().autoCdxThumbnails && isRunContextCurrent(ctx) && S.cdxThumbQueue.length && !S.stopped) {
+          setTimeout(() => { if (settings().autoCdxThumbnails && token === S.cdxThumbTaskToken && isRunContextCurrent(ctx)) queueCdxThumbsForCurrentVideos('continued'); }, 0);
+        } else if (settings().autoCdxThumbnails && isRunContextCurrent(ctx)) {
+          log('cdx-thumb-auto', 'Auto CDX thumb queue finished', { reason: reason || '', done, remaining: S.cdxThumbQueue.length, active: S.cdxThumbActive.size });
+        }
+      }
+    }
+  }
+  function cancelCdxThumbQueue(reason) {
+    S.cdxThumbTaskToken++;
+    S.cdxThumbQueue = [];
+    S.cdxThumbQueued.clear();
+    S.cdxThumbActive.clear();
+    S.cdxThumbManualRequested.clear();
+    S.cdxThumbRunning = false;
+    resetCdxCheckingStatuses(reason || 'CDX thumbnail queue cancelled');
+    log('cdx-thumb-auto', `Auto CDX thumb cancelled${reason ? ' — ' + reason : ''}`, { reason: reason || '' });
+    renderVideoList();
+  }
+
   function make2oeUrl(id) {
     return `https://web.archive.org/web/2oe_/http://wayback-fakeurl.archive.org/yt/${encodeURIComponent(id)}`;
   }
@@ -2424,6 +3921,18 @@
       resolved_2oe_url: result.resolved_2oe_url || '',
       checked_2oe_at: result.checkedAt || Date.now()
     });
+    updateVideoStatusFromEvidence(video);
+  }
+
+  function isRetryable2oeResult(result) {
+    if (!result) return false;
+    const statusNum = Number(result.status);
+    const text = String(result.status_2oe || '').toLowerCase();
+    return statusNum === -1 || (statusNum >= 500 && statusNum <= 599) || /timeout|5\d\d|error|failed|-1/.test(text);
+  }
+
+  function isFinal2oeResult(result) {
+    return !!(result && result.checkedAt && !isRetryable2oeResult(result));
   }
 
   async function check2oe(video, opts) {
@@ -2435,7 +3944,7 @@
 
     const k = status2oeCacheKey(video.id);
     const cached = getStore(k, null);
-    if (cached && cached.checkedAt && Date.now() - cached.checkedAt < 7 * 24 * 60 * 60 * 1000) {
+    if (!opts.forceRetry && cached && cached.checkedAt && Date.now() - cached.checkedAt < 7 * 24 * 60 * 60 * 1000 && !isRetryable2oeResult(cached)) {
       apply2oeResultToVideo(video, cached);
       renderVideoList();
       return cached;
@@ -2468,18 +3977,23 @@
     return out;
   }
 
+  function videoIsUnavailableForAuto2oe(v) {
+    return String((v && v.videoStatus) || '').toLowerCase() === 'unavailable';
+  }
+
   function unchecked2oeVideosFromCurrentResults() {
     const out = [];
     const seen = new Set();
     for (const v of S.videos.values()) {
       if (!v || !isValidVideoId(v.id) || seen.has(v.id)) continue;
       seen.add(v.id);
+      if (!videoIsUnavailableForAuto2oe(v)) continue;
       if (v.status_2oe === 'checking') continue;
       const cached = getStore(status2oeCacheKey(v.id), null);
-      if (v.status_2oe || cached) {
-        if (cached && !v.status_2oe) apply2oeResultToVideo(v, cached);
-        continue;
-      }
+      if (cached && !v.status_2oe) apply2oeResultToVideo(v, cached);
+      if (v.status_2oe === 'checking') continue;
+      if (cached && !isRetryable2oeResult(cached)) continue;
+      if (v.status_2oe && !isRetryable2oeResult({ status: v.status, status_2oe: v.status_2oe })) continue;
       out.push(v);
     }
     return out;
@@ -2488,16 +4002,49 @@
   async function queue2oeChecksForCurrentVideos(reason) {
     if (!settings().autoCheck2oe) return;
     const token = ++S.oe2CancelToken;
-    const queue = unchecked2oeVideosFromCurrentResults();
-    log('2oe-auto', `Auto-check 2oe queued ${queue.length} current unchecked video(s)${reason ? ' — ' + reason : ''}`, { count: queue.length, reason: reason || '' });
-    for (const v of queue) {
+    const initial = unchecked2oeVideosFromCurrentResults();
+    const retryFirst = initial.filter(v => {
+      const c = getStore(status2oeCacheKey(v.id), null);
+      return isRetryable2oeResult(c) || isRetryable2oeResult({ status: v.status, status_2oe: v.status_2oe });
+    });
+    const rest = initial.filter(v => !retryFirst.includes(v));
+    const queue = retryFirst.concat(rest);
+    const conc = concurrencySetting('oe2');
+    const maxRounds = 4;
+    log('2oe-auto', `Auto-check 2oe queued ${queue.length} unavailable video(s)${reason ? ' — ' + reason : ''}`, { count: queue.length, retryFirst: retryFirst.length, unchecked: rest.length, concurrency: conc, reason: reason || '', throttle: `${QUEUE_THROTTLES.oe2.level}/${QUEUE_THROTTLES.oe2.maxLevel}` });
+    let current = queue.map(v => ({ video: v, lastStatus: '' }));
+    let checked = 0, finalCount = 0;
+    for (let round = 1; round <= maxRounds && current.length; round++) {
       if (!settings().autoCheck2oe || token !== S.oe2CancelToken || S.stopped) break;
-      while (S.paused && !S.stopped && token === S.oe2CancelToken && settings().autoCheck2oe) await sleep(300);
-      if (!settings().autoCheck2oe || token !== S.oe2CancelToken || S.stopped) break;
-      await check2oe(v, { auto: true, token });
-      await sleep(200);
+      const nextRound = [];
+      let next = 0, done = 0;
+      log('2oe-auto', `round ${round}/${maxRounds} start: ${current.length} item(s), concurrency ${conc}`, { round, total: current.length, concurrency: conc, throttle: `${QUEUE_THROTTLES.oe2.level}/${QUEUE_THROTTLES.oe2.maxLevel}` });
+      async function worker(workerId) {
+        while (settings().autoCheck2oe && token === S.oe2CancelToken && !S.stopped) {
+          const i = next++;
+          if (i >= current.length) break;
+          const item = current[i];
+          while (S.paused && !S.stopped && token === S.oe2CancelToken && settings().autoCheck2oe) await sleep(300);
+          if (!settings().autoCheck2oe || token !== S.oe2CancelToken || S.stopped) break;
+          await queueDelay('oe2', round, `${i + 1}/${current.length} worker ${workerId}`);
+          const out = await check2oe(item.video, { auto: true, token, forceRetry: true });
+          checked++;
+          if (out && isRetryable2oeResult(out)) {
+            throttleFail('oe2');
+            item.lastStatus = out.status_2oe || out.status || '';
+            if (round < maxRounds) nextRound.push(item);
+          } else if (out) {
+            throttleSuccess('oe2');
+            finalCount++;
+          }
+          done++;
+          if (done % 10 === 0 || done === current.length) log('2oe-auto', `round ${round}/${maxRounds} progress ${done}/${current.length}; retry next=${nextRound.length}; final=${finalCount}`, { round, done, total: current.length, retryNext: nextRound.length, checked, finalCount, throttle: `${QUEUE_THROTTLES.oe2.level}/${QUEUE_THROTTLES.oe2.maxLevel}` });
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(conc, current.length || 1) }, (_, i) => worker(i + 1)));
+      current = nextRound;
     }
-    if (token === S.oe2CancelToken && settings().autoCheck2oe) log('2oe-auto', 'Auto-check 2oe queue finished', { reason: reason || '' });
+    if (token === S.oe2CancelToken && settings().autoCheck2oe) log('2oe-auto', 'Auto-check 2oe queue finished', { reason: reason || '', checked, finalCount, retryRemaining: current.length });
   }
 
   function cancel2oeQueue(reason) {
@@ -2510,25 +4057,8 @@
   }
 
   async function autoCheck2oeForCapture(capture, nonce) {
-    if (!settings().autoCheck2oe || !capture || !capture.ok) return;
-    const token = S.oe2CancelToken;
-    const ids = [];
-    const seen = new Set();
-    for (const item of capture.items || []) {
-      if (!item || !item.id || seen.has(item.id)) continue;
-      seen.add(item.id);
-      const v = S.videos.get(item.id) || item;
-      if (v.status_2oe || getStore(status2oeCacheKey(item.id), null)) continue;
-      ids.push(item.id);
-    }
-    for (const id of ids) {
-      if (S.stopped || nonce !== S.scanNonce || token !== S.oe2CancelToken || !settings().autoCheck2oe) break;
-      while (S.paused && !S.stopped && token === S.oe2CancelToken && settings().autoCheck2oe) await sleep(300);
-      if (S.stopped || nonce !== S.scanNonce || token !== S.oe2CancelToken || !settings().autoCheck2oe) break;
-      const v = S.videos.get(id);
-      if (v) await check2oe(v, { auto: true, token });
-      await sleep(200);
-    }
+    if (!settings().autoCheck2oe || !capture || !capture.ok || nonce !== S.scanNonce) return;
+    await queue2oeChecksForCurrentVideos(`capture ${capture.timestamp || ''}`);
   }
 
   function extractMobileSpriteUrl(html, ts) {
@@ -2553,7 +4083,8 @@
     return /\bmobile-top\b|\bmobile-watch\b|\bmasthead-mobile\b|\byt-mobile\b|<ytm-|\bmobile\s+watch\b|\bvideoListItem\b|\bvt\?cids=|\bclient=mv-google\b|\bdesktop_uri\b|\bclass=["'][^"']*\bvEntry\b/i.test(html);
   }
 
-  function parseMobileVideoTables(source, ts, pageUrl) {
+  function parseMobileVideoTables(legacySource, ts, pageUrl) {
+    const source = String(legacySource || '');
     const html = String(source || '');
     if (!looksLikeMobileSnapshot(html, pageUrl)) return [];
     const out = [];
@@ -2648,40 +4179,43 @@
 
   function parseSuggestions(html, ts, pageUrl) {
     const source = String(html || '');
+    const legacySource = materializeLegacyWatchSource(source);
 
-    // 2025+ pages can contain only yt-lockup-view-model sidebar rows.
-    // Try this parser before older layout probes so it cannot be hidden behind
-    // a stale/generic parser path.
-    if (hasYtLockupMarkers(source)) {
-      const ytLockupFirst = parseYtLockupViewModel2025(source, ts, pageUrl);
-      if (ytLockupFirst.length) return ytLockupFirst;
+    // 2025+ fetched pages usually keep sidebar rows in ytInitialData JSON.
+    // Merge modern lockup/shorts with compactVideoRenderer so mixed captures do not
+    // stop after the Shorts shelf and miss normal related videos.
+    if (/lockupViewModel|shortsLockupViewModel|compactVideoRenderer/i.test(source)) {
+      const ytInitialDataLockups = parseYtInitialDataLockupViewModels2025(source, ts, pageUrl);
+      const ytInitialDataCompact = parseYtInitialDataCompactVideoRenderers(source, ts, pageUrl);
+      const mergedModern = mergeSuggestionItemsPrimaryFirst(ytInitialDataLockups, ytInitialDataCompact);
+      if (mergedModern.length) return mergedModern;
     }
 
-    const sideResults2006 = parseSideResults2006Dec(source, ts, pageUrl);
-    if (sideResults2006.length) return enrichItemsWithFlashRvs(sideResults2006, source, ts, pageUrl);
-    const relatedVids2007 = parseRelatedVidsBody2007Nov(source, ts, pageUrl);
-    if (relatedVids2007.length) return enrichItemsWithFlashRvs(relatedVids2007, source, ts, pageUrl);
-    const relatedEntry2008Mar = parseRelatedEntry2008Mar(source, ts, pageUrl);
-    if (relatedEntry2008Mar.length) return enrichItemsWithFlashRvs(relatedEntry2008Mar, source, ts, pageUrl);
-    const watchDiscoverbox2008 = parseWatchDiscoverbox2008May(source, ts, pageUrl);
-    if (watchDiscoverbox2008.length) return enrichItemsWithFlashRvs(watchDiscoverbox2008, source, ts, pageUrl);
-    const videoEntry2008Dec = parseVideoEntry2008DecMiniList(source, ts, pageUrl);
-    if (videoEntry2008Dec.length) return enrichItemsWithFlashRvs(videoEntry2008Dec, source, ts, pageUrl);
-    const watch7Sidebar2015 = parseWatch7SidebarModules2015(source, ts, pageUrl);
-    if (watch7Sidebar2015.length) return enrichItemsWithFlashRvs(watch7Sidebar2015, source, ts, pageUrl);
-    const watchRelated2010 = parseWatchRelatedVideoList2010(source, ts, pageUrl);
-    if (watchRelated2010.length) return enrichItemsWithFlashRvs(watchRelated2010, source, ts, pageUrl);
-    const watchRevealRelated2014 = parseWatchRevealRelatedComment2014(source, ts, pageUrl);
-    if (watchRevealRelated2014.length) return enrichItemsWithFlashRvs(watchRevealRelated2014, source, ts, pageUrl);
-    const flashRvs = parseFlashRvsSuggestions(source, ts, pageUrl);
+    const sideResults2006 = parseSideResults2006Dec(legacySource, ts, pageUrl);
+    if (sideResults2006.length) return enrichItemsWithFlashRvs(sideResults2006, legacySource, ts, pageUrl);
+    const relatedVids2007 = parseRelatedVidsBody2007Nov(legacySource, ts, pageUrl);
+    if (relatedVids2007.length) return enrichItemsWithFlashRvs(relatedVids2007, legacySource, ts, pageUrl);
+    const relatedEntry2008Mar = parseRelatedEntry2008Mar(legacySource, ts, pageUrl);
+    if (relatedEntry2008Mar.length) return enrichItemsWithFlashRvs(relatedEntry2008Mar, legacySource, ts, pageUrl);
+    const watchDiscoverbox2008 = parseWatchDiscoverbox2008May(legacySource, ts, pageUrl);
+    if (watchDiscoverbox2008.length) return enrichItemsWithFlashRvs(watchDiscoverbox2008, legacySource, ts, pageUrl);
+    const videoEntry2008Dec = parseVideoEntry2008DecMiniList(legacySource, ts, pageUrl);
+    if (videoEntry2008Dec.length) return enrichItemsWithFlashRvs(videoEntry2008Dec, legacySource, ts, pageUrl);
+    const watch7Sidebar2015 = parseWatch7SidebarModules2015(legacySource, ts, pageUrl);
+    if (watch7Sidebar2015.length) return enrichItemsWithFlashRvs(watch7Sidebar2015, legacySource, ts, pageUrl);
+    const watchRelated2010 = parseWatchRelatedVideoList2010(legacySource, ts, pageUrl);
+    if (watchRelated2010.length) return enrichItemsWithFlashRvs(watchRelated2010, legacySource, ts, pageUrl);
+    const watchRevealRelated2014 = parseWatchRevealRelatedComment2014(legacySource, ts, pageUrl);
+    if (watchRevealRelated2014.length) return enrichItemsWithFlashRvs(watchRevealRelated2014, legacySource, ts, pageUrl);
+    const flashRvs = parseFlashRvsSuggestions(legacySource, ts, pageUrl);
     if (flashRvs.length) return flashRvs;
-    const mobileItems = parseMobileVideoTables(source, ts, pageUrl);
+    const mobileItems = parseMobileVideoTables(legacySource, ts, pageUrl);
     if (mobileItems.length) return mobileItems;
     const ytInitialDataCompact2017 = parseYtInitialDataCompactVideoRenderers(source, ts, pageUrl);
-    const ytLockupViewModel2025 = parseYtLockupViewModel2025(source, ts, pageUrl);
+    const ytInitialDataLockup2025 = parseYtInitialDataLockupViewModels2025(source, ts, pageUrl);
     const polymerDomCompact2020 = parsePolymerDomCompactRenderers(source, ts, pageUrl);
-    if (ytInitialDataCompact2017.length) return mergeSuggestionItemsPrimaryFirst(ytInitialDataCompact2017, mergeSuggestionItemsPrimaryFirst(ytLockupViewModel2025, polymerDomCompact2020));
-    if (ytLockupViewModel2025.length) return mergeSuggestionItemsPrimaryFirst(ytLockupViewModel2025, polymerDomCompact2020);
+    if (ytInitialDataCompact2017.length) return mergeSuggestionItemsPrimaryFirst(ytInitialDataCompact2017, mergeSuggestionItemsPrimaryFirst(ytInitialDataLockup2025, polymerDomCompact2020));
+    if (ytInitialDataLockup2025.length) return mergeSuggestionItemsPrimaryFirst(ytInitialDataLockup2025, polymerDomCompact2020);
     if (polymerDomCompact2020.length) return polymerDomCompact2020;
     const out = [];
     const seen = new Set();
@@ -2743,34 +4277,56 @@
     return rows;
   }
 
-  async function fetchCdx(seed, sourceMode) {
+  async function fetchCdx(seed, sourceMode, ctx) {
     const source = sourceMode === 'mobile' ? 'mobile' : 'desktop';
     const ck = `cdx:${source}:${seed}`;
     const cached = getStore(ck, null);
     if (cached && Array.isArray(cached.rows)) {
-      log('cache', `CDX cache hit for ${source} ${seed}: ${cached.rows.length} rows`, { cdxUrl: cached.cdxUrl || buildCdxUrl(seed, source), rawCached: !!cached.rawText });
+      if (isRunContextCurrent(ctx)) log('cache', `CDX cache hit for ${source} ${seed}: ${cached.rows.length} rows`, { cdxUrl: cached.cdxUrl || buildCdxUrl(seed, source), rawCached: !!cached.rawText });
       return cached.rows.map(r => Object.assign({}, r, { source }));
     }
     const url = buildCdxUrl(seed, source);
-    log('cdx-query', `Fetching ${source} CDX URL`, { cdxUrl: url, source });
-    const res = await request({ url, timeout: 60000 });
-    if (!res.ok) throw new Error(`CDX HTTP ${res.status}`);
-    const rawText = String(res.text || '');
-    const rows = parsePlainCdx(rawText).map(r => Object.assign({}, r, { source }));
-    setStore(ck, { rows, rawText, cdxUrl: url, source, savedAt: Date.now(), format: 'plain-cdx-default-original-query-no-fl' });
-    log('cdx', `Fetched ${rows.length} ${source} CDX rows`, { cdxUrl: url, source, rawBytes: rawText.length });
-    log('cdx-save', `Saved raw ${source} CDX: ${rows.length} row(s)`, { key: ck, rawBytes: rawText.length, source });
-    return rows;
+    const inflightKey = `${source}:${seed}`;
+    if (S.cdxInflight && S.cdxInflight.has(inflightKey)) {
+      if (isRunContextCurrent(ctx)) log('cdx-query', `Reusing in-flight ${source} CDX URL`, { cdxUrl: url, source });
+      const rows = await S.cdxInflight.get(inflightKey);
+      return (rows || []).map(r => Object.assign({}, r, { source }));
+    }
+    const work = (async () => {
+      if (isRunContextCurrent(ctx)) log('cdx-query', `Fetching ${source} CDX URL`, { cdxUrl: url, source });
+      const res = await request({ url, timeout: 60000, cancelCheck: () => !isRunContextCurrent(ctx) });
+      if (!isRunContextCurrent(ctx)) return [];
+      if (!res.ok) throw new Error(`CDX HTTP ${res.status}`);
+      const rawText = String(res.text || '');
+      const rows = parsePlainCdx(rawText).map(r => Object.assign({}, r, { source }));
+      const cdxCache = { rows, cdxUrl: url, source, savedAt: Date.now(), rawTextBytes: rawText.length, rawTextSkipped: !APP.storeRawCdxText, format: 'plain-cdx-default-original-query-no-fl' };
+      if (APP.storeRawCdxText) cdxCache.rawText = rawText;
+      setStore(ck, cdxCache);
+      if (isRunContextCurrent(ctx)) {
+        log('cdx', `Fetched ${rows.length} ${source} CDX rows`, { cdxUrl: url, source, rawBytes: rawText.length });
+        log('cdx-save', `Saved compact ${source} CDX rows: ${rows.length}; raw text skipped`, { key: ck, rawBytes: rawText.length, source, rawTextSkipped: !APP.storeRawCdxText });
+      }
+      return rows;
+    })();
+    S.cdxInflight.set(inflightKey, work);
+    try {
+      const rows = await work;
+      return (rows || []).map(r => Object.assign({}, r, { source }));
+    } finally {
+      if (S.cdxInflight && S.cdxInflight.get(inflightKey) === work) S.cdxInflight.delete(inflightKey);
+    }
   }
 
-  async function fetchCdxForSettings(seed) {
+  async function fetchCdxForSettings(seed, ctx) {
     const sourceMode = settings().sourceMode || 'desktop';
     if (sourceMode === 'both') {
-      const d = await fetchCdx(seed, 'desktop');
-      const m = await fetchCdx(seed, 'mobile');
+      const d = await fetchCdx(seed, 'desktop', ctx);
+      if (!isRunContextCurrent(ctx)) return null;
+      const m = await fetchCdx(seed, 'mobile', ctx);
+      if (!isRunContextCurrent(ctx)) return null;
       return d.concat(m).sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')) || String(a.source || '').localeCompare(String(b.source || '')));
     }
-    return fetchCdx(seed, sourceMode === 'mobile' ? 'mobile' : 'desktop');
+    return fetchCdx(seed, sourceMode === 'mobile' ? 'mobile' : 'desktop', ctx);
   }
 
   function rowInActiveDateRange(row, st) {
@@ -3065,7 +4621,42 @@
     return parsed;
   }
 
-  async function fetchAndParseSnapshot(row) {
+  function upsertSnapshotRetryPlaceholder(row, page, status, attempt, maxTries, queued) {
+    const key = selectedRowKey(row);
+    const oldCap = (S.parsedCaptures || []).find(c => captureKey(c) === key);
+    const cap = {
+      timestamp: row.timestamp,
+      original: row.original,
+      cdxSource: row.source || 'desktop',
+      page,
+      ok: false,
+      status,
+      items: [],
+      retryQueued: !!queued,
+      retryHad: true,
+      retryResolved: false,
+      retryAttempt: queued ? Math.min(maxTries, attempt + 1) : attempt,
+      retryMaxTries: maxTries,
+      retryStatus: status,
+      reason: queued
+        ? `HTTP ${status} retry queued`
+        : `HTTP ${status} failed`,
+      parserVersion: APP.parserVersion,
+      _selectedIndex: selectedIndexForKey(key)
+    };
+    const idx = S.parsedCaptures.findIndex(c => captureKey(c) === key);
+    if (idx >= 0) S.parsedCaptures[idx] = cap;
+    else S.parsedCaptures.push(cap);
+    sortParsedCapturesInPlace();
+    renderCapture(cap);
+    renderVideoList();
+    renderStats();
+    return cap;
+  }
+
+  async function fetchAndParseSnapshot(row, ctx) {
+    ctx = ctx || makeRunContext();
+    if (!isRunContextCurrent(ctx)) return null;
     const page = snapshotUrl(row.timestamp, row.original);
     const cacheKey = parsedCacheKey(row);
     const htmlKey = snapshotHtmlCacheKey(row);
@@ -3093,7 +4684,8 @@
       }
     }
 
-    const cachedHtml = getStore(htmlKey, null);
+    const cachedHtml = APP.storeSnapshotHtml ? await getSnapshotHtmlCache(row) : null;
+    if (!isRunContextCurrent(ctx)) return null;
     if (cachedHtml && typeof cachedHtml.html === 'string') {
       log('html-cache', `Reparsing cached HTML for ${displayTimestamp(row.timestamp)}`, { timestamp: row.timestamp, waybackUrl: page, parserVersion: APP.parserVersion, htmlChars: cachedHtml.html.length });
       const parsedFromCache = parseSnapshotHtml(row, page, cachedHtml.html, 'html-cache');
@@ -3127,7 +4719,8 @@
         seed: S.seed || ''
       });
 
-      const res = await request({ url: page, timeout: 60000 });
+      const res = await request({ url: page, timeout: 60000, cancelCheck: () => !isRunContextCurrent(ctx) });
+      if (!isRunContextCurrent(ctx)) return null;
       const redirected = !!(res.finalUrl && res.finalUrl !== page);
       log('snapshot-fetch', `Fetch done: ${displayTimestamp(row.timestamp)} status=${res.status} htmlLen=${String(res.text || '').length}${redirected ? ' redirected' : ''}`, {
         timestamp: row.timestamp,
@@ -3161,9 +4754,18 @@
         }
         S.snapshotThrottleMs = 0;
         S.snapshotRetryAttempt = 0;
-        setStore(htmlKey, { timestamp: row.timestamp, original: row.original, page, html: String(res.text || ''), status: res.status, savedAt: Date.now() });
+        if (!isRunContextCurrent(ctx)) return null;
+        if (APP.storeSnapshotHtml) await setSnapshotHtmlCache(row, { timestamp: row.timestamp, original: row.original, page, html: String(res.text || ''), status: res.status, savedAt: Date.now(), appVersion: APP.version });
+        if (!isRunContextCurrent(ctx)) return null;
         const parsed = parseSnapshotHtml(row, page, res.text, 'network');
         parsed.status = res.status;
+        if (attempt > 1 && lastFail) {
+          parsed.retryHad = true;
+          parsed.retryResolved = true;
+          parsed.retryAttempt = attempt;
+          parsed.retryMaxTries = APP.snapshotRetryMaxTries;
+          parsed.retryStatus = lastFail.status;
+        }
         if (row._discarded) {
           parsed.discardedScan = true;
           parsed.discardReason = row._discardReason || '';
@@ -3205,6 +4807,7 @@
           throttleSeconds,
           waybackUrl: page
         });
+        upsertSnapshotRetryPlaceholder(row, page, res.status, attempt, APP.snapshotRetryMaxTries, true);
       } else {
         log('snapshot-5xx-final', `Snapshot HTTP ${res.status}; maximum retries reached (${attempt}/${APP.snapshotRetryMaxTries})`, {
           timestamp: row.timestamp,
@@ -3215,11 +4818,12 @@
           throttleSeconds,
           waybackUrl: page
         });
+        upsertSnapshotRetryPlaceholder(row, page, res.status, attempt, APP.snapshotRetryMaxTries, false);
       }
       renderStats();
       if (attempt >= APP.snapshotRetryMaxTries) break;
       await sleep(S.snapshotThrottleMs);
-      if (S.stopped) break;
+      if (!isRunContextCurrent(ctx) || S.stopped) return null;
     }
 
     const fail = {
@@ -3231,9 +4835,13 @@
       status: lastFail ? lastFail.status : -1,
       items: [],
       failedAt: Date.now(),
-      reason: `snapshot HTTP ${lastFail ? lastFail.status : -1}`,
+      reason: `HTTP ${lastFail ? lastFail.status : -1} failed`,
       throttleMs: S.snapshotThrottleMs,
-      retryAttempt: S.snapshotRetryAttempt,
+      retryHad: true,
+      retryResolved: false,
+      retryAttempt: S.snapshotRetryAttempt || APP.snapshotRetryMaxTries,
+      retryMaxTries: APP.snapshotRetryMaxTries,
+      retryStatus: lastFail ? lastFail.status : -1,
       parserVersion: APP.parserVersion
     };
     if (row._discarded) {
@@ -3250,6 +4858,7 @@
         status: fail.status
       });
     }
+    if (!isRunContextCurrent(ctx)) return null;
     setStore(cacheKey, fail);
     S.currentSnapshot = '';
     renderStats();
@@ -3257,8 +4866,20 @@
   }
 
   function ingestItems(capture) {
-    S.parsedCaptures.push(capture);
+    const key = captureKey(capture);
+    const existingIdx = S.parsedCaptures.findIndex(c => captureKey(c) === key);
+    if (existingIdx >= 0) {
+      const oldCap = S.parsedCaptures[existingIdx];
+      capture._selectedIndex = Number.isFinite(oldCap && oldCap._selectedIndex) ? oldCap._selectedIndex : selectedIndexForKey(key);
+      capture._newFromRange = oldCap && oldCap._newFromRange !== undefined ? !!oldCap._newFromRange : !!capture._newFromRange;
+      S.parsedCaptures[existingIdx] = capture;
+    } else {
+      capture._selectedIndex = selectedIndexForKey(key);
+      S.parsedCaptures.push(capture);
+    }
+    sortParsedCapturesInPlace();
     if (!capture.ok) return;
+    const live0Targets = [];
     if (capture.items.length) S.stats.parserHits++; else S.stats.parserMisses++;
     for (const item of capture.items) {
       S.stats.videosFound++;
@@ -3272,21 +4893,24 @@
         item.occurrences = [{ timestamp: item.timestamp, captureUrl: item.captureUrl, parser: item.parser, title: item.title }];
         item.firstSeen = item.timestamp;
         S.videos.set(item.id, item);
+        live0Targets.push(item);
       }
     }
     S.stats.uniqueVideos = S.videos.size;
     updateThumbnailStatsFromVideos();
+    if (live0Targets.length) scheduleLive0StatusChecks(live0Targets, `capture ${capture.timestamp || ''}`);
   }
 
   async function runScan() {
     if (S.running) return;
     const myNonce = ++S.scanNonce;
+    const myCtx = makeRunContext(S.seed, myNonce);
     S.running = true; S.paused = false; S.stopped = false;
     resetResults();
     renderAll();
     try {
-      const rows = await fetchCdxForSettings(S.seed);
-      if (S.stopped || myNonce !== S.scanNonce) return;
+      const rows = await fetchCdxForSettings(S.seed, myCtx);
+      if (!rows || S.stopped || myNonce !== S.scanNonce || !isRunContextCurrent(myCtx)) return;
       S.cdxRows = rows;
       S.selectedRows = filterRows(rows, S.seed);
       renderAll();
@@ -3299,6 +4923,10 @@
         saved: S.parsedCaptures.length,
         missing: rowsToScan.length
       });
+      if (settings().triageOnly) {
+        showIncompleteCachedOnlyNotice(rowsToScan.length, 'scan start');
+        return;
+      }
       if (rowsToScan.length !== S.selectedRows.length) {
         log('saved-results', `Using ${S.parsedCaptures.length} saved capture(s); scanning ${rowsToScan.length} missing capture(s)`, { saved: S.parsedCaptures.length, missing: rowsToScan.length, selected: S.selectedRows.length });
       }
@@ -3308,32 +4936,36 @@
         if (!currentSelectedKeySet().has(selectedRowKey(row))) continue;
         while (S.paused && !S.stopped && myNonce === S.scanNonce) await sleep(300);
         if (S.stopped || myNonce !== S.scanNonce) break;
-        const cap = await fetchAndParseSnapshot(row);
-        if (S.stopped || myNonce !== S.scanNonce) break;
+        const cap = await fetchAndParseSnapshot(row, myCtx);
+        if (!cap || S.stopped || myNonce !== S.scanNonce || !isRunContextCurrent(myCtx)) break;
         if (!captureIsStillSelected(cap)) continue;
         S.stats.scanned++;
-        cap._newFromRange = false;
+        cap._selectedIndex = selectedIndexForRow(row);
+        cap._newFromRange = true;
         ingestItems(cap);
         renderCapture(cap);
         syncBadCapture(cap);
         renderVideoList();
         renderStats();
-        await verifyCaptureThumbs(cap, myNonce);
+        if (settings().fallbackThumbnails) await verifyCaptureThumbs(cap, myNonce, myCtx);
         await autoCheck2oeForCapture(cap, myNonce);
         await sleep(APP.scanDelayMs);
       }
       {
         for (const video of S.videos.values()) {
           if (S.stopped || myNonce !== S.scanNonce) break;
-          if (video.liveThumb) continue;
+          if (!shouldQueueThumbCheck(video)) continue;
           while (S.paused && !S.stopped && myNonce === S.scanNonce) await sleep(300);
-          await verifyVideoThumb(video, video.firstSeen);
+          await verifyVideoThumb(video, video.firstSeen, { autoFallback: true, nonce: myNonce, seed: myCtx.seed, ctx: myCtx });
           if (S.stopped || myNonce !== S.scanNonce) break;
           renderVideoList(); renderStats();
           await sleep(120);
         }
       }
-      if (myNonce === S.scanNonce) log('done', `Scan complete: ${S.stats.uniqueVideos} unique videos, ${S.dupes.length} duplicates`);
+      if (myNonce === S.scanNonce) {
+        if (S.stopped) log('stopped', `Scan stopped by user: ${S.stats.uniqueVideos} unique videos, ${S.dupes.length} duplicates kept so far`);
+        else log('done', `Scan complete: ${S.stats.uniqueVideos} unique videos, ${S.dupes.length} duplicates`);
+      }
     } catch (e) {
       if (myNonce === S.scanNonce) {
         log('error', e.message || String(e));
@@ -3353,29 +4985,77 @@
     S.dupes = [];
     S.snapshotRetryAttempt = 0;
     S.currentSnapshot = '';
+    S.live0Queue = [];
+    S.live0Queued = new Set();
+    S.live0TaskToken++;
+    S.live0Running = false;
     Object.assign(S.stats, { cdxTotal:0, accepted:0, discarded:0, selected:0, scanned:0, parserHits:0, parserMisses:0, videosFound:0, uniqueVideos:0, thumbnailQueued:0, thumbnailDone:0, discardedSelected:0, discardedRecovered:0, discardedRedirects:0, discardedFetchFailed:0 });
   }
 
-  function pushSeed(id) {
+  function getSeedTitleMap() {
+    const map = getStore('seedTitles', {});
+    return map && typeof map === 'object' && !Array.isArray(map) ? map : {};
+  }
+
+  function saveSeedTitle(id, title) {
+    const seed = normalizeSeedInput(id);
+    const clean = cleanText(title || '').trim();
+    if (!seed || !clean) return;
+    const map = getSeedTitleMap();
+    if (map[seed] === clean) return;
+    map[seed] = clean.slice(0, 220);
+    const hist = getStore('seedHistory', []);
+    const keep = new Set((Array.isArray(hist) ? hist : []).map(normalizeSeedInput).filter(Boolean));
+    keep.add(seed);
+    for (const k of Object.keys(map)) if (!keep.has(k) && Object.keys(map).length > APP.maxHistory * 2) delete map[k];
+    setStore('seedTitles', map);
+  }
+
+  function storedSeedTitle(id) {
+    const seed = normalizeSeedInput(id);
+    if (!seed) return '';
+    const map = getSeedTitleMap();
+    return cleanText(map[seed] || '');
+  }
+
+  function pushSeed(id, title) {
     const seed = normalizeSeedInput(id);
     if (!seed) return;
     setStore('lastSeed', seed);
+    if (title) saveSeedTitle(seed, title);
     const hist = getStore('seedHistory', []);
     const safeHist = Array.isArray(hist) ? hist.map(normalizeSeedInput).filter(Boolean) : [];
     const next = [seed, ...safeHist.filter(x => x !== seed)].slice(0, APP.maxHistory);
     setStore('seedHistory', next);
   }
 
-  function stopYouTubePlayback() {
+  let launchPauseGuardTimer = null;
+  let launchPauseGuardUntil = 0;
+  let launchPauseGuardHandler = null;
+
+  function pauseYouTubePlayback() {
+    try {
+      const p = document.querySelector('#movie_player');
+      if (p && typeof p.pauseVideo === 'function') p.pauseVideo();
+      if (p && typeof p.stopVideo === 'function') p.stopVideo();
+    } catch (_) {}
     document.querySelectorAll('video,audio').forEach(m => {
       try {
+        m.autoplay = false;
+        m.removeAttribute('autoplay');
         m.pause();
+      } catch (_) {}
+    });
+  }
+
+  function stopYouTubePlayback() {
+    pauseYouTubePlayback();
+    document.querySelectorAll('video,audio').forEach(m => {
+      try {
         m.muted = true;
         m.defaultMuted = true;
         m.volume = 0;
-        m.autoplay = false;
         m.preload = 'none';
-        m.removeAttribute('autoplay');
         m.removeAttribute('src');
         m.querySelectorAll('source').forEach(src => {
           try { src.removeAttribute('src'); src.remove(); } catch (_) {}
@@ -3385,22 +5065,46 @@
     });
     try {
       const p = document.querySelector('#movie_player');
-      if (p && typeof p.stopVideo === 'function') p.stopVideo();
-      if (p && typeof p.pauseVideo === 'function') p.pauseVideo();
       if (p && typeof p.mute === 'function') p.mute();
       if (p && typeof p.clearVideo === 'function') p.clearVideo();
     } catch (_) {}
-    document.querySelectorAll('#movie_player, ytd-player, #player, #player-container, #player-container-outer, ytd-watch-flexy')
-      .forEach(el => { try { el.remove(); } catch (_) {} });
   }
 
   function startPlaybackKillLoop(ms) {
-    const endAt = Date.now() + (ms || 6000);
+    const endAt = Date.now() + (ms || 12000);
     const tick = () => {
       stopYouTubePlayback();
       if (Date.now() < endAt) setTimeout(tick, 120);
     };
     tick();
+  }
+
+  function startLaunchPauseGuard(ms) {
+    const duration = ms || 12000;
+    launchPauseGuardUntil = Math.max(launchPauseGuardUntil || 0, Date.now() + duration);
+    if (!launchPauseGuardHandler) {
+      launchPauseGuardHandler = function(ev) {
+        if (Date.now() > launchPauseGuardUntil) return;
+        try { if (ev && ev.target && typeof ev.target.pause === 'function') ev.target.pause(); } catch (_) {}
+        try { ev.preventDefault(); ev.stopImmediatePropagation(); } catch (_) {}
+        setTimeout(pauseYouTubePlayback, 0);
+      };
+      try { document.addEventListener('play', launchPauseGuardHandler, true); } catch (_) {}
+      try { document.addEventListener('playing', launchPauseGuardHandler, true); } catch (_) {}
+    }
+    if (launchPauseGuardTimer) clearInterval(launchPauseGuardTimer);
+    pauseYouTubePlayback();
+    launchPauseGuardTimer = setInterval(() => {
+      if (Date.now() > launchPauseGuardUntil) {
+        clearInterval(launchPauseGuardTimer);
+        launchPauseGuardTimer = null;
+        try { document.removeEventListener('play', launchPauseGuardHandler, true); } catch (_) {}
+        try { document.removeEventListener('playing', launchPauseGuardHandler, true); } catch (_) {}
+        launchPauseGuardHandler = null;
+        return;
+      }
+      pauseYouTubePlayback();
+    }, 250);
   }
 
 
@@ -3412,10 +5116,17 @@
 
 
   function launch(id) {
+    const nextSeedForScroll = normalizeSeedInput(id) || getDetectedSeed() || getLastSeed();
+    if (S.seed && nextSeedForScroll && S.seed !== nextSeedForScroll) saveSeedScroll(S.seed, 'before launch seed switch');
     S.scanNonce++;
     S.rangeTaskToken++;
     S.thumbTaskToken++;
+    S.cdxThumbTaskToken++;
+    S.live0TaskToken++;
+    S.fallbackThumbRunning = false;
+    S.fallbackThumbRerunNeeded = false;
     cancel2oeQueue('starting video changed');
+    cancelCdxThumbQueue('starting video changed');
     resetCheckingThumbStatuses('starting video changed');
     S.stopped = true;
     S.paused = false;
@@ -3424,14 +5135,17 @@
     S.originalUrl = `http://www.youtube.com/watch?v=${S.seed}`;
     document.title = `${APP.name} ${APP.version}`;
     pushSeed(S.seed);
-    if (isYouTubeHost()) startPlaybackKillLoop(7000);
+    if (isYouTubeHost()) { startLaunchPauseGuard(12000); startPlaybackKillLoop(12000); }
     document.documentElement.innerHTML = trustedHtml('<head><title></title></head><body></body>');
     document.title = `${APP.name} ${APP.version}`;
     buildUi();
-    if (isYouTubeHost()) startPlaybackKillLoop(7000);
+    scheduleSeedScrollRestore(S.seed, 'after UI rebuild');
+    if (isYouTubeHost()) { startLaunchPauseGuard(12000); startPlaybackKillLoop(12000); }
     log('seed', `Loaded UI for ${S.seed}`, { seed: S.seed, sourceMode: settings().sourceMode });
-    if (settings().triageOnly) reparseTriageOnly();
-    else runScan();
+    // Show only incomplete is a display filter. Seed changes must still load the normal
+    // selected/cached captures first, otherwise seeds with zero review rows can leave stale UI.
+    runScan();
+    scheduleSeedScrollRestore(S.seed, 'after scan start');
   }
 
   function closeSeedLauncher() {
@@ -3607,6 +5321,12 @@
           <button id="themeBtn"></button>
           <button id="dedupeBtn"></button>
           <button id="fallbackThumbBtn"></button>
+          <button id="jumpThumbQueueBtn">Jump to Thumb Queue</button>
+          <button id="autoCdxThumbBtn"></button>
+          <label>2oe async <input id="async2oeConcurrency" type="number" min="1" max="8"></label>
+          <label>Fallback async <input id="fallbackThumbConcurrency" type="number" min="1" max="4"></label>
+          <label>CDX async <input id="cdxThumbConcurrency" type="number" min="1" max="3"></label>
+          <label>Show Only <select id="showOnlyStatus"><option value="all">All</option><option value="available">Available</option><option value="unavailable">Unavailable</option></select></label>
           <button id="triageOnlyBtn"></button>
           <button id="discardedScanBtn"></button>
           <button id="auto2oeBtn"></button>
@@ -3615,6 +5335,7 @@
           <button id="stopBtn">Stop</button>
           <button id="reloadBtn">Reload scan</button>
           <button id="debugBtn">Copy debug report</button>
+          <button id="captureOrderAuditBtn">Audit Capture Order</button>
           <button id="copyAllParseDebugBtn">Copy parser debug all</button>
           <button id="copyMissingParseDebugBtn">Copy parser debug missing</button>
           <button id="copyBadCapturesBtn">Copy bad pages</button>
@@ -3624,8 +5345,9 @@
           <button id="copyLogsBtn">Copy logs</button>
           <button id="clearLogsBtn">Clear logs</button>
           <button id="rawCdxBtn">Export raw CDX</button>
+          <button id="exportFetchedHtmlBtn">Export cached Need Reviews HTML</button>
           <button id="retryFailedBtn">Retry failed HTTP pages</button>
-          <button id="reparseHtmlBtn">Reparse downloaded pages</button>
+          <button id="reparseHtmlBtn">Reparse cached HTML</button>
           <button id="reparseTriageBtn">Reparse incomplete results</button>
           <button id="clearResolvedBtn">Clear resolved review history</button>
           <button id="restoreResolvedBtn">Move resolved back to review</button>
@@ -3637,7 +5359,7 @@
           <button data-clear="parsed">Clear parser/result cache</button>
           <button data-clear="html">Clear raw HTML cache</button>
           <button data-clear="history">Clear Seed History</button>
-          <button data-clear="all">Clear all crawler data</button>
+          <button data-clear="all">Clear all WYSC data</button>
         </section>
         </div>
         <main>
@@ -3647,7 +5369,7 @@
             <h2 id="capturesTitle">Scanned captures (0 / 0)</h2><div id="captures"></div>
             <h2>Needs review</h2><div id="badCaptures"></div>
             <h2>Resolved review</h2><div id="resolvedCaptures"></div>
-            <h2>Log</h2><pre id="log"></pre>
+            <h2 class="logTitle">Log <button id="logZoomBtn" title="Zoom logs" type="button">🔍</button></h2><pre id="log"></pre>
           </aside>
           <section id="results"><div id="videoList"></div></section>
         </main>
@@ -3665,6 +5387,16 @@
     const safeHist = Array.isArray(hist) ? hist.map(normalizeSeedInput).filter(Boolean) : [];
     list.innerHTML = trustedHtml(safeHist.map(id => `<option value="${escapeAttr(id)}"></option>`).join(''));
   }
+
+  function knownTitleForVideoId(id) {
+    const direct = S.videos && S.videos.get(id);
+    if (direct && direct.title) return direct.title;
+    for (const cap of S.parsedCaptures || []) {
+      for (const item of (cap && cap.items) || []) if (item && item.id === id && item.title) return item.title;
+    }
+    return storedSeedTitle(id);
+  }
+
   function renderSeedHistoryMenu() {
     const menu = document.getElementById('seedHistoryMenu');
     if (!menu) return;
@@ -3674,7 +5406,7 @@
     const rows = [];
     rows.push(`<div class="seedMenuTitle">Recent starting videos</div>`);
     if (safeHist.length) {
-      for (const id of safeHist) { const cur = id === S.seed; rows.push(`<button class="seedMenuItem ${cur ? 'currentSeed' : ''}" data-seed="${escapeAttr(id)}" ${cur ? 'disabled' : ''}>${escapeHtml(id)}${cur ? ' ✓ Current' : ''}</button>`); }
+      for (const id of safeHist) { const cur = id === S.seed; { const title = knownTitleForVideoId(id); rows.push(`<button class="seedMenuItem ${cur ? 'currentSeed' : ''}" data-seed="${escapeAttr(id)}" ${cur ? 'disabled' : ''}>${escapeHtml(id)}${title ? ' — ' + escapeHtml(title) : ''}${cur ? ' ✓ Current' : ''}</button>`); } }
     } else {
       rows.push(`<div class="seedMenuEmpty">No recent starting videos</div>`);
     }
@@ -3717,10 +5449,42 @@
 
 
 
+
+  function commitPendingDateRangeInputs(reason) {
+    const ids = ['minYear', 'minMonth', 'maxYear', 'maxMonth'];
+    const els = {};
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (!el) return false;
+      els[id] = el;
+    }
+    const normalized = normalizeRangeSettings({
+      minYear: els.minYear.value,
+      minMonth: els.minMonth.value,
+      maxYear: els.maxYear.value,
+      maxMonth: els.maxMonth.value
+    });
+    const cur = normalizeRangeSettings(settings());
+    const changed = ids.some(id => String(normalized[id]) !== String(cur[id]));
+    if (!changed) return false;
+    saveSettings(normalized);
+    for (const id of ids) els[id].value = normalized[id];
+    log('settings', `Applied pending date range${reason ? ' — ' + reason : ''}`, {
+      minYear: normalized.minYear,
+      minMonth: normalized.minMonth,
+      maxYear: normalized.maxYear,
+      maxMonth: normalized.maxMonth,
+      reason: reason || ''
+    });
+    return true;
+  }
+
   async function applyStartingVideo(value, opts) {
+    commitPendingDateRangeInputs('starting video changed');
     const seed = normalizeSeedInput(value);
     const forceReload = !!(opts && opts.forceReload);
     const source = opts && opts.source ? opts.source : 'seed-input';
+    const seedTitle = opts && opts.title ? cleanText(opts.title) : '';
     if (!seed) {
       alert('Enter a valid 11-character YouTube video ID or watch URL.');
       return;
@@ -3732,10 +5496,16 @@
     }
 
     const from = S.seed || '';
+    saveSeedScroll(from, 'before seed switch');
     S.scanNonce++;
     S.rangeTaskToken++;
     S.thumbTaskToken++;
+    S.cdxThumbTaskToken++;
+    S.live0TaskToken++;
+    S.fallbackThumbRunning = false;
+    S.fallbackThumbRerunNeeded = false;
     cancel2oeQueue('starting video changed');
+    cancelCdxThumbQueue('starting video changed');
     resetCheckingThumbStatuses('starting video changed');
     S.stopped = true;
     S.paused = false;
@@ -3747,7 +5517,7 @@
     if (seedInput) seedInput.value = seed;
     const status = document.getElementById('status');
     if (status) status.innerHTML = trustedHtml(`Seed: <code>${escapeHtml(seed)}</code>`);
-    pushSeed(seed);
+    pushSeed(seed, seedTitle);
     populateSeedHistoryList();
     renderHistory();
     renderSeedHistoryMenu();
@@ -3756,13 +5526,13 @@
     launch(seed);
   }
 
-  function switchSeedFromThumbnail(id) {
+  function switchSeedFromThumbnail(id, title) {
     const seed = normalizeSeedInput(id);
     if (!seed) return;
     // Clicking a parsed related-video thumbnail means: make that video the new starting video.
     // This uses the same path as the editable Starting video box, so the UI is rebuilt and
     // the scan restarts only when the seed actually changes.
-    applyStartingVideo(seed, { source: 'thumbnail-click' });
+    applyStartingVideo(seed, { source: 'thumbnail-click', title: cleanText(title || '') });
   }
 
   function flashApplied(el) {
@@ -3778,7 +5548,29 @@
     flashApplied(e);
   }
 
+  function jumpToThumbQueue() {
+    const selectors = [];
+    if (settings().fallbackThumbnails) selectors.push('.thumbQueueItem[data-thumb-mode="fallback"]');
+    if (settings().autoCdxThumbnails) selectors.push('.thumbQueueItem[data-thumb-mode="cdx"]');
+    if (!selectors.length) selectors.push('.thumbQueueItem[data-thumb-queue="1"]');
+    let el = null;
+    for (const selector of selectors) {
+      el = document.querySelector(selector);
+      if (el) break;
+    }
+    if (!el) {
+      log('thumb-queue', 'No queued or checking Auto Fallback/CDX thumbnail item found');
+      return;
+    }
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.remove('thumbQueueHighlight');
+    void el.offsetWidth;
+    el.classList.add('thumbQueueHighlight');
+    setTimeout(() => { try { el.classList.remove('thumbQueueHighlight'); } catch (_) {} }, 2200);
+  }
+
   function bindUi() {
+    try { window.addEventListener('scroll', () => scheduleSeedScrollSave('window scroll'), { passive: true }); } catch (_) {}
     const st = settings();
     const $ = s => document.querySelector(s);
     populateSeedHistoryList();
@@ -3813,6 +5605,19 @@
       ev.preventDefault();
       toggleSeedHistoryMenu();
     };
+    const logEl = $('#log');
+    if (logEl) {
+      S.logAuto = true;
+      logEl.addEventListener('scroll', () => { S.logAuto = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8; });
+      setTimeout(() => { if (S.logAuto) logEl.scrollTop = logEl.scrollHeight; }, 0);
+    }
+    const capEl = $('#captures');
+    if (capEl) capEl.addEventListener('scroll', () => { S.capturesAuto = capEl.scrollTop + capEl.clientHeight >= capEl.scrollHeight - 8; });
+    const badEl = $('#badCaptures');
+    if (badEl) badEl.addEventListener('scroll', () => { S.badCapturesAuto = badEl.scrollTop + badEl.clientHeight >= badEl.scrollHeight - 8; });
+    const resEl = $('#resolvedCaptures');
+    if (resEl) resEl.addEventListener('scroll', () => { S.resolvedCapturesAuto = resEl.scrollTop + resEl.clientHeight >= resEl.scrollHeight - 8; });
+    const logZoomBtn = $('#logZoomBtn'); if (logZoomBtn) logZoomBtn.onclick = showLogZoom;
     document.addEventListener('click', ev => {
       const menu = document.getElementById('seedHistoryMenu');
       const btn = document.getElementById('seedHistoryMenuBtn');
@@ -3823,6 +5628,11 @@
     if ($('#sourceMode')) $('#sourceMode').value = st.sourceMode || 'desktop';
     if ($('#sourceMode')) $('#sourceMode').onchange = e => { saveSettings({ sourceMode: e.target.value }); applySelectionChange('source changed', { reloadCdx: true }); };
     $('#mode').value = st.mode;
+    const availSel = $('#showOnlyStatus');
+    if (availSel) availSel.value = normalizeShowOnlyStatus(st);
+    const oe2Conc = $('#async2oeConcurrency'); if (oe2Conc) { oe2Conc.value = concurrencySetting('oe2'); oe2Conc.onchange = e => saveConcurrencySetting('oe2', e.target.value); }
+    const fbConc = $('#fallbackThumbConcurrency'); if (fbConc) { fbConc.value = concurrencySetting('thumb'); fbConc.onchange = e => saveConcurrencySetting('thumb', e.target.value); }
+    const cdxConc = $('#cdxThumbConcurrency'); if (cdxConc) { cdxConc.value = concurrencySetting('cdx'); cdxConc.onchange = e => saveConcurrencySetting('cdx', e.target.value); }
     const range = normalizeRangeSettings(st);
     $('#minYear').value = range.minYear;
     $('#minMonth').value = range.minMonth;
@@ -3890,13 +5700,34 @@
     fillCustomModeControls();
     $('#themeBtn').onclick = () => { const n = settings().theme === 'dark' ? 'light' : 'dark'; saveSettings({ theme: n }); document.body.className = `wytsc ${n}`; renderToggles(); };
     $('#dedupeBtn').onclick = () => { saveSettings({ showDedupes: !settings().showDedupes }); renderToggles(); renderVideoList(); };
-    $('#fallbackThumbBtn').onclick = () => { saveSettings({ fallbackThumbnails: !settings().fallbackThumbnails }); renderToggles(); };
-    $('#triageOnlyBtn').onclick = () => {
+    const showOnlyStatusEl = $('#showOnlyStatus');
+    if (showOnlyStatusEl) showOnlyStatusEl.onchange = e => {
+      const value = normalizeShowOnlyStatus({ showOnlyStatus: e.target.value });
+      saveSettings({ showOnlyStatus: value, showOnlyUnavailable: value === 'unavailable' });
+      renderToggles();
+      log('filter', `Show Only ${value}`);
+      renderVideoList();
+    };
+    $('#jumpThumbQueueBtn').onclick = jumpToThumbQueue;
+    $('#fallbackThumbBtn').onclick = () => {
+      const next = !settings().fallbackThumbnails;
+      saveSettings({ fallbackThumbnails: next });
+      renderToggles();
+      if (next) {
+        checkThumbnailsForCurrentCaptures('fallback thumbnail toggle ON');
+      } else { S.fallbackThumbRerunNeeded = false; S.fallbackThumbRunning = false; S.thumbTaskToken++; resetCheckingThumbStatuses('fallback thumbnail toggle OFF'); }
+    };
+    $('#triageOnlyBtn').onclick = async () => {
       const next = !settings().triageOnly;
       saveSettings({ triageOnly: next });
       renderToggles();
-      if (next) reparseTriageOnly();
-      else applySelectionChange('show only incomplete OFF');
+      log('filter', `Show only incomplete ${next ? 'ON' : 'OFF'}`);
+      if (next) await stopActiveWork('Show only incomplete enabled');
+      renderAll();
+      if (!next) {
+        const missing = missingRowsFromSelected(S.selectedRows);
+        scanMissingRowsIncremental(missing, 'Show only incomplete disabled');
+      }
     };
     $('#discardedScanBtn').onclick = () => { saveSettings({ scanDiscarded: !settings().scanDiscarded }); renderToggles(); applySelectionChange('scan discarded rows changed'); };
     $('#auto2oeBtn').onclick = () => {
@@ -3906,11 +5737,21 @@
       if (next) queue2oeChecksForCurrentVideos('toggle ON');
       else cancel2oeQueue('toggle OFF');
     };
+    const autoCdxBtn = $('#autoCdxThumbBtn');
+    if (autoCdxBtn) autoCdxBtn.onclick = () => {
+      const next = !settings().autoCdxThumbnails;
+      saveSettings({ autoCdxThumbnails: next });
+      if (!next) cancelCdxThumbQueue('toggle OFF');
+      renderToggles();
+      if (next && !settings().fallbackThumbnails) log('cdx-thumb-auto', 'Auto CDX enabled before Auto Fallback; for best page/timestamp priority, turn Auto Fallback ON first.', { autoCdxThumbnails: true, fallbackThumbnails: false });
+      if (next) queueCdxThumbsForCurrentVideos('toggle ON');
+    };
     $('#copyDiscardedReportBtn').onclick = copyDiscardedReport;
-    $('#pauseBtn').onclick = () => { S.paused = !S.paused; $('#pauseBtn').textContent = S.paused ? 'Resume' : 'Pause'; };
-    $('#stopBtn').onclick = () => { S.stopped = true; S.paused = false; };
+    $('#pauseBtn').onclick = pauseOrResumeWork;
+    $('#stopBtn').onclick = requestStopWork;
     $('#reloadBtn').onclick = reloadScan;
     $('#debugBtn').onclick = copyDebugReport;
+    const captureOrderAuditBtn = $('#captureOrderAuditBtn'); if (captureOrderAuditBtn) captureOrderAuditBtn.onclick = copyCaptureOrderAudit;
     $('#copyAllParseDebugBtn').onclick = () => copyParserDebug(false);
     $('#copyMissingParseDebugBtn').onclick = () => copyParserDebug(true);
     $('#copyLogsBtn').onclick = copyLogs;
@@ -3920,6 +5761,7 @@
     $('#clearBadCapturesBtn').onclick = clearBadCaptures;
     $('#clearLogsBtn').onclick = clearLogs;
     $('#rawCdxBtn').onclick = exportRawCdx;
+    $('#exportFetchedHtmlBtn').onclick = exportNeedsReviewHtml;
     $('#reparseHtmlBtn').onclick = reparseCachedHtml;
     $('#reparseTriageBtn').onclick = reparseTriageOnly;
     $('#clearResolvedBtn').onclick = clearResolvedTriage;
@@ -3927,6 +5769,7 @@
     $('#retryFailedBtn').onclick = retryFailedCaptures;
     document.querySelectorAll('[data-clear]').forEach(b => b.onclick = () => clearCache(b.dataset.clear));
     renderToggles();
+    applyButtonTooltips();
   }
 
   function rowFromBadCapture(badRow) {
@@ -3953,26 +5796,41 @@
       for (let i = 0; i < 80 && S.running; i++) await sleep(100);
     }
     const myNonce = ++S.scanNonce;
+    const selectedBefore = (S.selectedRows || []).slice();
+    const selectedKeySet = currentSelectedKeySet(selectedBefore);
+    const rowsToReparse = selectedBefore.length ? startRows.filter(r => selectedKeySet.has(selectedRowKey(rowFromBadCapture(r)))) : startRows;
+    if (!rowsToReparse.length) {
+      log('triage-only', 'No selected incomplete captures to reparse');
+      renderAll();
+      return;
+    }
     S.running = true;
     S.stopped = false;
     S.paused = false;
-    S.parsedCaptures = [];
-    S.videos = new Map();
-    S.dupes = [];
     S.currentSnapshot = '';
-    Object.assign(S.stats, { scanned:0, parserHits:0, parserMisses:0, videosFound:0, uniqueVideos:0, thumbnailQueued:0, thumbnailDone:0, selected:startRows.length });
-    const capBox = document.getElementById('captures'); if (capBox) capBox.textContent = '';
-    S.selectedRows = startRows.map(rowFromBadCapture);
+
+    // Reparse Incomplete is a repair action, not a display filter. Keep the
+    // current selected capture set and merge reparsed captures back into it;
+    // the separate Show only incomplete toggle decides what is visible.
+    if (selectedBefore.length) {
+      S.selectedRows = selectedBefore;
+      loadSavedCapturesForSelectedRows(selectedBefore, 'before incomplete reparse');
+    }
     renderAll();
 
     let reparsed = 0, fixed = 0, stillBad = 0, missingHtml = 0;
-    log('triage-only', `Reparsing ${startRows.length} review capture(s) from cached HTML only`, { count: startRows.length, parserVersion: APP.parserVersion });
+    log('triage-only', `Reparsing ${rowsToReparse.length} selected incomplete capture(s) from cached HTML only`, {
+      count: rowsToReparse.length,
+      selected: selectedBefore.length || (S.selectedRows || []).length,
+      showOnlyIncomplete: !!settings().triageOnly,
+      parserVersion: APP.parserVersion
+    });
 
-    for (const badRow of startRows) {
+    for (const badRow of rowsToReparse) {
       if (S.stopped || myNonce !== S.scanNonce) break;
       while (S.paused && !S.stopped) await sleep(300);
 
-      const cachedHtml = cachedHtmlTextForBadCapture(badRow);
+      const cachedHtml = await cachedHtmlTextForBadCapture(badRow);
       if (!cachedHtml) {
         missingHtml++;
         log('triage-only-missing-html', `No cached HTML for ${badRow.display || displayTimestamp(badRow.timestamp)}`, { timestamp: badRow.timestamp, waybackUrl: badRow.page });
@@ -3983,22 +5841,32 @@
       const page = badRow.page || snapshotUrl(row.timestamp, row.original);
       const beforeBad = getBadCaptures().some(r => String(r.timestamp) === String(badRow.timestamp));
       const cap = parseSnapshotHtml(row, page, cachedHtml, 'triage-only-html-cache');
-      S.stats.scanned++;
-      ingestItems(cap);
-      renderCapture(cap);
+      cap._selectedIndex = selectedIndexForRow(row);
+      replaceParsedCapture(cap);
       syncBadCapture(cap);
+      rebuildVideosFromCaptures();
       const afterBad = getBadCaptures().some(r => String(r.timestamp) === String(badRow.timestamp));
       if (beforeBad && !afterBad) fixed++;
       else if (afterBad) stillBad++;
       reparsed++;
+      renderCaptures();
       renderVideoList();
       renderStats();
       await sleep(10);
     }
 
+    if (selectedBefore.length) S.selectedRows = selectedBefore;
+    rebuildVideosFromCaptures();
     S.running = false;
     renderAll();
-    log('triage-only-done', `Review-only reparse complete: fixed ${fixed}, still bad ${stillBad}, missing cached HTML ${missingHtml}`, { reparsed, fixed, stillBad, missingHtml, parserVersion: APP.parserVersion });
+    log('triage-only-done', `Incomplete reparse complete: fixed ${fixed}, still incomplete ${stillBad}, missing cached HTML ${missingHtml}`, {
+      reparsed,
+      fixed,
+      stillBad,
+      missingHtml,
+      showOnlyIncomplete: !!settings().triageOnly,
+      parserVersion: APP.parserVersion
+    });
   }
 
   async function reparseCachedHtml() {
@@ -4013,7 +5881,9 @@
     }
 
     try {
-      const rows = S.cdxRows && S.cdxRows.length ? S.cdxRows : await fetchCdxForSettings(S.seed);
+      const myCtx = makeRunContext(S.seed, S.scanNonce);
+      const rows = S.cdxRows && S.cdxRows.length ? S.cdxRows : await fetchCdxForSettings(S.seed, myCtx);
+      if (!rows || !isRunContextCurrent(myCtx)) return;
       const selected = filterRows(rows, S.seed);
       let missing = 0;
 
@@ -4027,7 +5897,9 @@
 
       let reparsed = 0;
       for (const row of selected) {
-        const cachedHtml = getStore(snapshotHtmlCacheKey(row), null);
+        if (!isRunContextCurrent(myCtx)) return;
+        const cachedHtml = await getSnapshotHtmlCache(row);
+        if (!isRunContextCurrent(myCtx)) return;
         if (!cachedHtml || typeof cachedHtml.html !== 'string') { missing++; continue; }
         const page = snapshotUrl(row.timestamp, row.original);
         const htmlText = cachedHtml.html;
@@ -4045,7 +5917,7 @@
         syncBadCapture(cap);
         renderVideoList();
         renderStats();
-        await verifyCaptureThumbs(cap, S.scanNonce);
+        if (settings().fallbackThumbnails) await verifyCaptureThumbs(cap, S.scanNonce, myCtx);
         reparsed++;
         await sleep(20);
       }
@@ -4069,10 +5941,18 @@
   }
 
   function replaceParsedCapture(capture) {
-    const idx = S.parsedCaptures.findIndex(c => String(c.timestamp) === String(capture.timestamp));
-    if (idx >= 0) S.parsedCaptures[idx] = capture;
-    else S.parsedCaptures.push(capture);
-    S.parsedCaptures.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+    const key = captureKey(capture);
+    const idx = S.parsedCaptures.findIndex(c => captureKey(c) === key || String(c.timestamp) === String(capture.timestamp));
+    if (idx >= 0) {
+      const oldCap = S.parsedCaptures[idx];
+      capture._selectedIndex = Number.isFinite(oldCap && oldCap._selectedIndex) ? oldCap._selectedIndex : selectedIndexForKey(key);
+      capture._newFromRange = oldCap && oldCap._newFromRange !== undefined ? !!oldCap._newFromRange : !!capture._newFromRange;
+      S.parsedCaptures[idx] = capture;
+    } else {
+      capture._selectedIndex = selectedIndexForKey(key);
+      S.parsedCaptures.push(capture);
+    }
+    sortParsedCapturesInPlace();
   }
 
   function rebuildVideosFromCaptures() {
@@ -4080,7 +5960,7 @@
     const keepThumbState = (id, target) => {
       const old = oldVideos.get(id);
       if (old) {
-        ['thumbDebug', 'liveThumb', 'displayThumb', 'videoStatus', 'thumbnailStatus', 'thumbnailReason', 'usedPreviewThumb'].forEach(k => {
+        ['thumbDebug', 'liveThumb', 'displayThumb', 'thumbnailStatus', 'thumbnailReason', 'usedPreviewThumb'].forEach(k => {
           if (old[k] != null) target[k] = old[k];
         });
       }
@@ -4116,6 +5996,7 @@
     }
     S.stats.uniqueVideos = S.videos.size;
     updateThumbnailStatsFromVideos();
+    scheduleLive0StatusChecks(Array.from(S.videos.values()), 'saved/rebuilt captures');
   }
 
   async function retryCapture(timestamp) {
@@ -4132,12 +6013,19 @@
     renderCaptures();
     renderVideoList();
     renderStats();
-    const cap = await fetchAndParseSnapshot(row);
+    const myCtx = makeRunContext(S.seed, S.scanNonce);
+    const cap = await fetchAndParseSnapshot(row, myCtx);
+    if (!cap || !isRunContextCurrent(myCtx)) return;
     if (cap && cap.ok && oldStatus && oldStatus !== 200) {
-      cap.recoveredFrom = `HTTP ${oldStatus}`;
+      cap.retryHad = true;
+      cap.retryResolved = true;
+      cap.retryAttempt = (oldCap && oldCap.retryAttempt) || cap.retryAttempt || 1;
+      cap.retryMaxTries = (oldCap && oldCap.retryMaxTries) || cap.retryMaxTries || APP.snapshotRetryMaxTries;
+      cap.retryStatus = (oldCap && (oldCap.retryStatus || oldCap.status)) || oldStatus;
       cap.reason = cap.reason || `Recovered after HTTP ${oldStatus}`;
       setStore(parsedCacheKey(row), cap);
     }
+    cap._selectedIndex = selectedIndexForRow(row);
     replaceParsedCapture(cap);
     syncBadCapture(cap);
     rebuildVideosFromCaptures();
@@ -4146,7 +6034,7 @@
     renderStats();
     if (cap && cap.ok) {
       log('retry-success', `Retry recovered ${displayTimestamp(timestamp)}: ${(cap.items || []).length} parsed`, { timestamp, recoveredFrom: oldStatus ? `HTTP ${oldStatus}` : null, waybackUrl: cap.page });
-      await verifyCaptureThumbs(cap, S.scanNonce);
+      if (settings().fallbackThumbnails) await verifyCaptureThumbs(cap, S.scanNonce, myCtx);
     } else {
       log('retry-failed', `Retry failed ${displayTimestamp(timestamp)}: ${cap ? cap.reason : 'unknown error'}`, { timestamp, status: cap && cap.status, waybackUrl: cap && cap.page });
     }
@@ -4188,6 +6076,72 @@
     return `${cap && (cap.cdxSource || cap.source) || 'desktop'}:${cap && cap.timestamp || ''}`;
   }
 
+  function selectedIndexForKey(key, selected) {
+    const rows = selected || S.selectedRows || [];
+    for (let i = 0; i < rows.length; i++) {
+      if (selectedRowKey(rows[i]) === key) return i;
+    }
+    return Number.POSITIVE_INFINITY;
+  }
+
+  function selectedIndexForRow(row, selected) {
+    return selectedIndexForKey(selectedRowKey(row), selected);
+  }
+
+  function captureSortIndex(cap) {
+    const byCurrentSelection = selectedIndexForKey(captureKey(cap));
+    if (Number.isFinite(byCurrentSelection)) return byCurrentSelection;
+    if (Number.isFinite(cap && cap._selectedIndex)) return cap._selectedIndex;
+    return Number.POSITIVE_INFINITY;
+  }
+
+  function sortParsedCapturesInPlace() {
+    S.parsedCaptures = (S.parsedCaptures || []).sort((a, b) => {
+      const ai = captureSortIndex(a);
+      const bi = captureSortIndex(b);
+      if (ai !== bi) return ai - bi;
+      return String(a && a.timestamp || '').localeCompare(String(b && b.timestamp || ''))
+        || String(a && (a.cdxSource || a.source) || '').localeCompare(String(b && (b.cdxSource || b.source) || ''));
+    });
+    for (const cap of S.parsedCaptures) {
+      const idx = selectedIndexForKey(captureKey(cap));
+      if (Number.isFinite(idx)) cap._selectedIndex = idx;
+    }
+  }
+
+  function orderedCapturesBySelectedPlan(captures) {
+    const source = captures || S.parsedCaptures || [];
+    const byKey = new Map();
+    for (const cap of source) {
+      if (!cap || !captureIsStillSelected(cap)) continue;
+      const k = captureKey(cap);
+      if (!byKey.has(k)) byKey.set(k, cap);
+    }
+    const ordered = [];
+    for (const row of S.selectedRows || []) {
+      const cap = byKey.get(selectedRowKey(row));
+      if (cap) ordered.push(cap);
+    }
+    const included = new Set(ordered.map(captureKey));
+    const extras = source.filter(c => c && captureIsStillSelected(c) && !included.has(captureKey(c)));
+    extras.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')) || String(a.cdxSource || a.source || '').localeCompare(String(b.cdxSource || b.source || '')));
+    return ordered.concat(extras);
+  }
+
+  function reorderCaptureListDom() {
+    const e = document.getElementById('captures');
+    if (!e) return;
+    const order = new Map((S.selectedRows || []).map((row, i) => [selectedRowKey(row), i]));
+    const nodes = Array.from(e.querySelectorAll('.cap'));
+    nodes.sort((a, b) => {
+      const ai = order.has(a.dataset.capKey) ? order.get(a.dataset.capKey) : Number.POSITIVE_INFINITY;
+      const bi = order.has(b.dataset.capKey) ? order.get(b.dataset.capKey) : Number.POSITIVE_INFINITY;
+      if (ai !== bi) return ai - bi;
+      return String(a.dataset.capKey || '').localeCompare(String(b.dataset.capKey || ''));
+    });
+    for (const node of nodes) e.appendChild(node);
+  }
+
   function currentSelectedKeySet(selected) {
     return new Set((selected || S.selectedRows || []).map(selectedRowKey));
   }
@@ -4217,10 +6171,17 @@
       if (!cached || cached.parserVersion !== APP.parserVersion) continue;
       if (cached.failedAt && Date.now() - cached.failedAt >= APP.failCacheMs) continue;
       if (cached.status >= 500 && cached.status <= 599) continue;
+      cached._selectedIndex = selectedIndexForKey(k, selected);
+      cached._newFromRange = false;
       existing.set(k, cached);
       loaded++;
     }
-    S.parsedCaptures = [...existing.values()].sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')) || String(a.cdxSource || a.source || '').localeCompare(String(b.cdxSource || b.source || '')));
+    for (const [k, cap] of existing.entries()) {
+      cap._selectedIndex = Number.isFinite(cap._selectedIndex) ? cap._selectedIndex : selectedIndexForKey(k, selected);
+      if (cap._newFromRange === undefined) cap._newFromRange = false;
+    }
+    S.parsedCaptures = [...existing.values()];
+    sortParsedCapturesInPlace();
     rebuildVideosFromCaptures();
     S.stats.scanned = S.parsedCaptures.length;
     renderCaptures();
@@ -4235,10 +6196,30 @@
     return (selected || []).filter(r => !have.has(selectedRowKey(r)));
   }
 
+  function showIncompleteCachedOnlyNotice(missing, reason) {
+    const count = Number(missing || 0);
+    log('filter', `Show only incomplete is ON; using saved captures only${reason ? ' — ' + reason : ''}`, {
+      selected: S.selectedRows.length,
+      saved: S.parsedCaptures.length,
+      missing: count,
+      reason: reason || ''
+    });
+    renderAll();
+  }
+
   async function stopActiveWork(reason) {
     S.rangeTaskToken++;
     S.scanNonce++;
     S.thumbTaskToken++;
+    S.live0TaskToken++;
+    S.cdxThumbTaskToken++;
+    S.cdxThumbQueue = [];
+    S.cdxThumbQueued.clear();
+    S.cdxThumbActive.clear();
+    S.cdxThumbRunning = false;
+    S.live0Queue = [];
+    S.live0Queued = new Set();
+    S.live0Running = false;
     cancel2oeQueue(reason || 'settings changed');
     resetCheckingThumbStatuses(reason || 'settings changed');
     S.stopped = true;
@@ -4249,7 +6230,18 @@
 
   async function scanMissingRowsIncremental(rows, reason) {
     rows = rows || [];
-    const myNonce = ++S.scanNonce;
+    if (settings().triageOnly) {
+      showIncompleteCachedOnlyNotice(rows.length, reason || 'missing scan skipped');
+      return;
+    }
+    // Do not bump S.scanNonce here. applySelectionChange()/reload paths already
+    // invalidated old work before calling this function. Bumping the nonce here
+    // after Auto Fallback has just queued saved captures cancels that fresh
+    // fallback queue, leaving cards at "Archived thumb not checked" until the
+    // user toggles Auto Fallback off/on. Use a range token only for this range
+    // worker so thumbnail queues for the same selection can keep running.
+    const myNonce = S.scanNonce;
+    const myCtx = makeRunContext(S.seed, myNonce);
     const myRangeToken = ++S.rangeTaskToken;
     if (!rows.length) {
       log('range-update', `No missing captures to scan${reason ? ' — ' + reason : ''}`);
@@ -4267,8 +6259,8 @@
         if (!currentSelectedKeySet().has(selectedRowKey(row))) continue;
         while (S.paused && !S.stopped && myNonce === S.scanNonce && myRangeToken === S.rangeTaskToken) await sleep(300);
         if (S.stopped || myNonce !== S.scanNonce || myRangeToken !== S.rangeTaskToken) break;
-        const cap = await fetchAndParseSnapshot(row);
-        if (S.stopped || myNonce !== S.scanNonce || myRangeToken !== S.rangeTaskToken) break;
+        const cap = await fetchAndParseSnapshot(row, myCtx);
+        if (!cap || S.stopped || myNonce !== S.scanNonce || myRangeToken !== S.rangeTaskToken || !isRunContextCurrent(myCtx)) break;
         if (!captureIsStillSelected(cap)) continue;
         S.stats.scanned++;
         ingestItems(cap);
@@ -4276,7 +6268,7 @@
         syncBadCapture(cap);
         renderVideoList();
         renderStats();
-        await verifyCaptureThumbs(cap, myNonce);
+        if (settings().fallbackThumbnails) await verifyCaptureThumbs(cap, myNonce, myCtx);
         await autoCheck2oeForCapture(cap, myNonce);
         await sleep(APP.scanDelayMs);
       }
@@ -4293,8 +6285,10 @@
     if (!S.seed) return;
     opts = opts || {};
     await stopActiveWork(reason || 'selection changed');
+    const myCtx = makeRunContext(S.seed, S.scanNonce);
     let rows = S.cdxRows && S.cdxRows.length ? S.cdxRows : null;
-    if (!rows || opts.reloadCdx) rows = await fetchCdxForSettings(S.seed);
+    if (!rows || opts.reloadCdx) rows = await fetchCdxForSettings(S.seed, myCtx);
+    if (!rows || !isRunContextCurrent(myCtx)) return;
     S.cdxRows = rows;
     const selected = filterRows(rows, S.seed);
     S.selectedRows = selected;
@@ -4303,7 +6297,12 @@
     const missing = missingRowsFromSelected(selected);
     renderAll();
     log('selection-update', `Loaded saved results and found ${missing.length} missing capture(s)${reason ? ' — ' + reason : ''}`, { selected: selected.length, missing: missing.length, reason: reason || '' });
-    checkThumbnailsForCurrentCaptures(reason || 'selection changed');
+    if (settings().triageOnly) {
+      showIncompleteCachedOnlyNotice(missing.length, reason || 'selection changed');
+      return;
+    }
+    if (settings().fallbackThumbnails) checkThumbnailsForCurrentCaptures(reason || 'selection changed');
+    if (settings().autoCdxThumbnails) queueCdxThumbsForCurrentVideos(reason || 'selection changed');
     scanMissingRowsIncremental(missing, reason || 'selection changed');
   }
 
@@ -4319,6 +6318,8 @@
       await reparseTriageOnly();
       return;
     }
+    const range = normalizeRangeSettings(settings());
+    log('reload-range', `Reload scan effective range ${rangeLabel(range)}`, { mode: settings().mode, minYear: range.minYear, minMonth: range.minMonth, maxYear: range.maxYear, maxMonth: range.maxMonth });
     const restartNonce = ++S.scanNonce;
     S.thumbTaskToken++;
     cancel2oeQueue('scan reload/restart');
@@ -4326,14 +6327,28 @@
     S.stopped = true;
     S.paused = false;
     await sleep(150);
+    if (S.scanNonce !== restartNonce) return;
+    S.stopped = false;
+
     resetResults();
     const cap = document.getElementById('captures'); if (cap) cap.textContent = '';
-    const logBox = document.getElementById('log'); if (logBox) logBox.textContent = '';
     renderAll();
-    log('reload', 'Reload scan requested; persistent caches kept');
-    for (let i = 0; i < 80 && S.running; i++) await sleep(100);
-    if (S.scanNonce !== restartNonce) return;
-    runScan();
+    log('reload', 'Reload scan requested; reparsing cached HTML first, then scanning anything missing');
+
+    await reparseCachedHtml();
+    if (S.scanNonce !== restartNonce || settings().triageOnly) return;
+
+    const missing = missingRowsFromSelected(S.selectedRows || []);
+    if (missing.length) {
+      log('reload', `Cached HTML reparse done; scanning ${missing.length} missing capture(s)`, { missing: missing.length });
+      scanMissingRowsIncremental(missing, 'reload scan after cached HTML reparse');
+    } else {
+      log('reload', 'Cached HTML reparse done; no missing captures to scan');
+      if (settings().fallbackThumbnails) checkThumbnailsForCurrentCaptures('reload scan');
+      if (settings().autoCdxThumbnails) queueCdxThumbsForCurrentVideos('reload scan');
+      if (settings().autoCheck2oe) queue2oeChecksForCurrentVideos('reload scan');
+      renderAll();
+    }
   }
 
   async function restartFromCdx() {
@@ -4358,10 +6373,66 @@
     const set = (id, on, text) => { const b = document.getElementById(id); if (!b) return; b.textContent = text + ': ' + (on ? 'ON' : 'OFF'); b.className = on ? 'on' : 'off'; };
     set('themeBtn', st.theme === 'dark', 'Dark');
     set('dedupeBtn', st.showDedupes, 'Show dedupes');
-    set('fallbackThumbBtn', st.fallbackThumbnails, 'Fallback thumbnails');
+    set('fallbackThumbBtn', st.fallbackThumbnails, 'Auto fallback thumbnails');
+    set('autoCdxThumbBtn', st.autoCdxThumbnails, 'Auto CDX thumb');
+    const availSel = document.getElementById('showOnlyStatus'); if (availSel) availSel.value = normalizeShowOnlyStatus(st);
     set('triageOnlyBtn', st.triageOnly, 'Show only incomplete');
     set('discardedScanBtn', st.scanDiscarded, 'Scan discarded rows');
     set('auto2oeBtn', st.autoCheck2oe, 'Auto-check 2oe');
+    updatePauseStopButtons();
+    applyButtonTooltips();
+  }
+
+  function updatePauseStopButtons() {
+    const pause = document.getElementById('pauseBtn');
+    const stop = document.getElementById('stopBtn');
+    if (pause) {
+      pause.textContent = S.paused ? 'Resume' : 'Pause';
+      pause.className = S.paused ? 'on' : '';
+      pause.title = S.paused ? 'Resume queued work' : 'Pause after current in-flight request';
+    }
+    if (stop) {
+      stop.className = S.stopped ? 'off' : '';
+      stop.title = 'Stop after current in-flight work finishes';
+    }
+  }
+
+  function pauseOrResumeWork() {
+    if (!S.running && !settings().autoCheck2oe && !settings().fallbackThumbnails && !settings().autoCdxThumbnails) {
+      log('pause-ignored', 'Pause ignored: no active scan or auto queue is running.');
+      updatePauseStopButtons();
+      return;
+    }
+    if (S.stopped) {
+      log('pause-ignored', 'Pause ignored: stop is already requested.');
+      updatePauseStopButtons();
+      return;
+    }
+    if (S.paused) {
+      S.paused = false;
+      log('resume', 'Resume clicked: continuing queued work.');
+    } else {
+      S.paused = true;
+      log('pause', 'Pause requested: current in-flight request will finish; no new work should start while paused.');
+    }
+    updatePauseStopButtons();
+    renderStats();
+  }
+
+  function requestStopWork() {
+    if (S.stopped) {
+      log('stop', 'Stop already requested: waiting for current in-flight work to finish.');
+      updatePauseStopButtons();
+      return;
+    }
+    S.stopped = true;
+    S.paused = false;
+    S.oe2CancelToken++;
+    S.thumbTaskToken++;
+    S.cdxThumbTaskToken++;
+    log('stop', 'Stop requested: queues will halt after current in-flight work finishes.');
+    updatePauseStopButtons();
+    renderStats();
   }
 
 
@@ -4464,6 +6535,7 @@
       ev.preventDefault();
       jumpToCapture(b.dataset.ts);
     }));
+    if (S.resolvedCapturesAuto) e.scrollTop = e.scrollHeight;
   }
 
   function getBadCaptures() {
@@ -4684,22 +6756,22 @@ async function copyBadCaptureUrls() {
     log('debug', `Copied bad capture URLs: ${rows.length}`);
   }
 
-  function getCachedHtmlForBadCapture(row) {
+  async function getCachedHtmlForBadCapture(row) {
     if (!row || !row.timestamp) return null;
     const tried = [];
-    function tryKey(k) {
+    async function tryKey(k) {
       if (!k) return null;
       tried.push(k);
-      const cached = getStore(k, null);
-      return cached && typeof cached.html === 'string' ? cached : null;
+      const cached = await idbGet(k, null) || getStore(k, null);
+      return cached && typeof cached.html === 'string' ? Object.assign({}, cached, { _wyscKey: k, _wyscStore: cached._wyscStore || 'cache' }) : null;
     }
     const selected = (S.selectedRows || []).find(r => String(r.timestamp) === String(row.timestamp));
     if (selected) {
-      const cached = tryKey(snapshotHtmlCacheKey(selected));
+      const cached = await tryKey(snapshotHtmlCacheKey(selected));
       if (cached) return cached;
     }
     const pseudo = rowFromBadCapture(row);
-    const pseudoCached = tryKey(snapshotHtmlCacheKey(pseudo));
+    const pseudoCached = await tryKey(snapshotHtmlCacheKey(pseudo));
     if (pseudoCached) return pseudoCached;
 
     const allKeys = GM_listValues();
@@ -4713,16 +6785,18 @@ async function copyBadCaptureUrls() {
     });
     for (const fullKey of candidates) {
       const shortKey = fullKey.startsWith(APP.storagePrefix) ? fullKey.slice(APP.storagePrefix.length) : fullKey;
-      const cached = tryKey(shortKey);
+      const cached = await tryKey(shortKey);
       if (cached) return cached;
     }
+    const byTs = await findSnapshotHtmlCacheByTimestamp(row.timestamp);
+    if (byTs) return byTs;
     row.missingHtmlTriedKeys = tried.slice(0, 20);
     return null;
   }
 
 
-  function cachedHtmlTextForBadCapture(row) {
-    const cached = getCachedHtmlForBadCapture(row);
+  async function cachedHtmlTextForBadCapture(row) {
+    const cached = await getCachedHtmlForBadCapture(row);
     return cached && typeof cached.html === 'string' ? cached.html : '';
   }
 
@@ -4758,7 +6832,7 @@ async function copyBadCaptureUrls() {
     const rows = getBadCaptures();
     const map = new Map();
     for (const row of rows) {
-      const html = cachedHtmlTextForBadCapture(row);
+      const html = ''; // async HTML cache is skipped for grouping; copy/export buttons load it when needed.
       const layout = inferTriageLayout(row, html);
       const locale = inferTriageLocale(html);
       const problem = triageProblemKey(row);
@@ -4807,9 +6881,10 @@ async function copyBadCaptureUrls() {
       ''
     ];
     let withHtml = 0;
-    groups.forEach((g, i) => {
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
       const r = g.first;
-      const html = cachedHtmlTextForBadCapture(r);
+      const html = await cachedHtmlTextForBadCapture(r);
       if (html) withHtml++;
       const clipped = html.length > maxPerCapture ? html.slice(0, maxPerCapture) + `\n<!-- WYSC HTML clipped: ${html.length - maxPerCapture} more chars -->` : html;
       parts.push(
@@ -4828,7 +6903,7 @@ async function copyBadCaptureUrls() {
         clipped || '(no cached HTML found for this representative capture)',
         ''
       );
-    });
+    }
     await navigator.clipboard.writeText(parts.join('\n'));
     log('debug', `Copied representative bad HTML triage: ${groups.length} group(s), ${withHtml} with cached HTML`);
   }
@@ -4851,7 +6926,7 @@ async function copyBadCaptureUrls() {
     let withHtml = 0;
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
-      const cached = getCachedHtmlForBadCapture(r);
+      const cached = await getCachedHtmlForBadCapture(r);
       const html = cached && typeof cached.html === 'string' ? cached.html : '';
       if (html) withHtml++;
       const clipped = html.length > maxPerCapture ? html.slice(0, maxPerCapture) + `\n<!-- WYSC HTML clipped: ${html.length - maxPerCapture} more chars -->` : html;
@@ -4951,17 +7026,23 @@ async function copyBadCaptureUrls() {
       ev.preventDefault();
       jumpToCapture(b.dataset.ts);
     }));
+    if (S.badCapturesAuto) e.scrollTop = e.scrollHeight;
   }
 
   function renderLogHistory() {
     const e = document.getElementById('log');
     if (!e) return;
+    const shouldStick = S.logAuto !== false;
     e.textContent = '';
     const rows = (S.logs || []).slice(-180);
     for (const row of rows) renderLogLine(row);
+    if (shouldStick) {
+      S.logAuto = true;
+      e.scrollTop = e.scrollHeight;
+    }
   }
 
-  function renderAll() { renderToggles(); renderStats(); renderHistory(); renderCaptures(); renderBadCaptures(); renderResolvedTriage(); renderVideoList(); renderLogHistory(); }
+  function renderAll() { renderToggles(); renderStats(); renderHistory(); renderCaptures(); renderBadCaptures(); renderResolvedTriage(); renderVideoList(); renderLogHistory(); applyButtonTooltips(); runPendingSeedScrollRestore(); }
   function renderStats() {
     const e = document.getElementById('stats'); if (!e) return;
     const throttleSec = Math.round((S.snapshotThrottleMs || 0) / 1000);
@@ -4973,7 +7054,7 @@ async function copyBadCaptureUrls() {
       ? `custom: ${Math.max(1, Number(st.customPagesPerInterval) || 1)} per ${Math.max(1, Number(st.customIntervalEvery) || 1)} ${escapeHtml(st.customIntervalUnit || 'month')}(s), anchor month ${clampMonth(st.customAnchorMonth || 1)}`
       : st.mode;
     const current = S.currentSnapshot ? `<div><b>current snapshot</b>: ${escapeHtml(S.currentSnapshot)}</div>` : '';
-    const stateText = S.running ? (S.paused ? 'paused' : 'scanning') : 'idle';
+    const stateText = S.stopped ? 'stopped' : (S.running ? (S.paused ? 'paused' : 'scanning') : 'idle');
     const scannedText = `${S.parsedCaptures.length} / ${S.stats.selected || S.selectedRows.length || 0}`;
     e.innerHTML = trustedHtml(
       `<div class="summaryBox"><b>Current seed</b>: <code>${escapeHtml(S.seed || '')}</code></div>` +
@@ -5004,7 +7085,8 @@ async function copyBadCaptureUrls() {
     renderSeedHistoryMenu();
     e.innerHTML = trustedHtml(safeHist.map(id => {
       const cur = id === S.seed;
-      return `<button class="seed ${cur ? 'currentSeed' : ''}" data-id="${escapeAttr(id)}">${escapeHtml(id)}${cur ? ' ✓ Current' : ''}</button>`;
+      const title = knownTitleForVideoId(id);
+      return `<button class="seed ${cur ? 'currentSeed' : ''}" data-id="${escapeAttr(id)}">${escapeHtml(id)}${title ? ' — ' + escapeHtml(title) : ''}${cur ? ' ✓ Current' : ''}</button>`;
     }).join('') || '<em>No recent starting videos</em>');
     e.querySelectorAll('button.seed').forEach(b => b.onclick = () => {
       const seed = normalizeSeedInput(b.dataset.id);
@@ -5036,60 +7118,122 @@ async function copyBadCaptureUrls() {
     h.textContent = `Scanned captures (${S.parsedCaptures.length} / ${S.stats.selected || S.selectedRows.length || 0})`;
   }
 
-  function renderCapture(cap) {
-    const e = document.getElementById('captures'); if (!e || !cap) return;
-    if (!captureIsStillSelected(cap)) return;
-    const existing = e.querySelector(`[data-cap-key="${escapeAttr(captureKey(cap))}"]`);
-    if (existing) existing.remove();
-    const div = document.createElement('div');
-    const recovered = cap.recoveredFrom ? ` · recovered from ${cap.recoveredFrom}` : '';
-    div.className = cap.ok ? (cap.recoveredFrom ? 'cap ok recovered' : 'cap ok') : 'cap bad';
-    div.dataset.capKey = captureKey(cap);
-    const index = Math.max(1, S.parsedCaptures.findIndex(c => captureKey(c) === captureKey(cap)) + 1);
+  function captureRetryStatusParts(cap) {
+    if (!cap || !cap.retryHad) return null;
+    const max = cap.retryMaxTries || APP.snapshotRetryMaxTries || 5;
+    const attempt = Math.max(1, Math.min(max, Number(cap.retryAttempt || 0) || (cap.retryResolved ? 1 : max)));
+    const rawStatus = cap.retryStatus || cap.status || -1;
+    let label;
+    if (rawStatus === -1 || String(rawStatus) === '-1') label = 'network error';
+    else label = `HTTP ${rawStatus}`;
+    let state = cap.retryResolved ? 'recovered' : (cap.retryQueued ? 'retry queued' : 'failed');
+    return { cls: cap.retryResolved ? 'capRetryGood' : 'capRetryBad', text: `(${attempt}/${max}) ${label} ${state}` };
+  }
+
+  function captureRetryStatusHtml(cap) {
+    const p = captureRetryStatusParts(cap);
+    if (!p) return '';
+    return ` <span class="capRetryStatus ${p.cls}">${escapeHtml(p.text)}</span>`;
+  }
+
+  function captureNodeForSlot(slot) {
+    const row = slot && slot.row || null;
+    const cap = slot && slot.cap || null;
+    const key = slot && slot.key || (cap ? captureKey(cap) : selectedRowKey(row));
+    const timestamp = (cap && cap.timestamp) || (row && row.timestamp) || '';
+    const original = (cap && cap.original) || (row && row.original) || '';
+    const page = (cap && cap.page) || (timestamp ? snapshotUrl(timestamp, original) : '');
     const total = S.stats.selected || S.selectedRows.length || S.parsedCaptures.length || '?';
-    const status = cap.ok ? `${(cap.items || []).length} parsed${recovered}` : (cap.reason || `snapshot HTTP ${cap.status || '?'}`);
-    const retry = cap.ok ? '' : ` <button class="capRetry" data-ts="${escapeAttr(cap.timestamp)}" title="Retry only this snapshot">↻ Retry</button>`;
-    const jump = ` <button class="capJump" data-ts="${escapeAttr(cap.timestamp)}" title="Jump to this capture group">Jump to</button>`;
-    const isNew = cap._newFromRange ? '<span class="newBadge">NEW</span> ' : '';
-    div.innerHTML = trustedHtml(`<span class="capCount">(${index}/${total})</span> ${isNew}<a target="_blank" rel="noopener noreferrer" href="${escapeAttr(cap.page)}">${escapeHtml(displayTimestamp(cap.timestamp))}</a> <span>${escapeHtml(status)}</span>${jump}${retry}`);
-    e.appendChild(div);
-    while (e.childNodes.length > 250) e.removeChild(e.firstChild);
+    const index = Number.isFinite(slot && slot.index) ? slot.index + 1 : Math.max(1, selectedIndexForKey(key) + 1);
+    const div = document.createElement('div');
+    if (cap) div.className = cap.ok ? (cap.retryHad && cap.retryResolved ? 'cap ok recovered' : 'cap ok') : 'cap bad';
+    else div.className = 'cap pending';
+    div.dataset.capKey = key;
+    if (timestamp) div.dataset.ts = timestamp;
+    const status = cap ? (cap.ok ? `${(cap.items || []).length} parsed` : (cap.reason || `HTTP ${cap.status || '?'} failed`)) : 'pending / not fetched yet';
+    const retry = cap && !cap.ok ? ` <button class="capRetry" data-ts="${escapeAttr(timestamp)}" title="Retry only this snapshot">↻ Retry</button>` : '';
+    const jump = cap ? ` <button class="capJump" data-ts="${escapeAttr(timestamp)}" title="Jump to this capture group">Jump</button>` : '';
+    div.innerHTML = trustedHtml(`<span class="capCount">(${index}/${total})</span> <a target="_blank" rel="noopener noreferrer" href="${escapeAttr(page)}">${escapeHtml(displayTimestamp(timestamp))}</a> <span>${escapeHtml(status)}${cap ? captureRetryStatusHtml(cap) : ''}</span>${jump}${retry}`);
     const btn = div.querySelector('.capRetry');
     if (btn) btn.addEventListener('click', ev => { ev.preventDefault(); retryCapture(btn.dataset.ts); });
     const jumpBtn = div.querySelector('.capJump');
     if (jumpBtn) jumpBtn.addEventListener('click', ev => { ev.preventDefault(); jumpToCapture(jumpBtn.dataset.ts); });
-    updateCapturesTitle();
+    return div;
+  }
+
+  function selectedCaptureSlots() {
+    sortParsedCapturesInPlace();
+    const capByKey = new Map();
+    for (const cap of S.parsedCaptures || []) {
+      if (!cap || !captureIsStillSelected(cap)) continue;
+      const k = captureKey(cap);
+      if (!capByKey.has(k)) capByKey.set(k, cap);
+    }
+    const selected = S.selectedRows || [];
+    if (selected.length) {
+      return selected.map((row, index) => {
+        const key = selectedRowKey(row);
+        const cap = capByKey.get(key) || null;
+        if (cap) cap._selectedIndex = index;
+        return { row, cap, key, index };
+      });
+    }
+    return orderedCapturesBySelectedPlan(S.parsedCaptures).map((cap, index) => ({ row: null, cap, key: captureKey(cap), index }));
+  }
+
+  function renderCapture(cap) {
+    if (!cap || !captureIsStillSelected(cap)) return;
+    renderCaptures();
   }
   function displayCaptureIsIncomplete(cap) {
     return captureIssues(cap).length > 0;
   }
 
   function capturesForCurrentView() {
-    const rows = S.parsedCaptures.filter(c => captureIsStillSelected(c));
+    sortParsedCapturesInPlace();
+    const rows = orderedCapturesBySelectedPlan(S.parsedCaptures);
     return settings().triageOnly ? rows.filter(displayCaptureIsIncomplete) : rows;
   }
 
   function renderCaptures() {
     const e = document.getElementById('captures'); if (!e) return;
+    sortParsedCapturesInPlace();
     e.textContent = '';
-    const rowsAll = capturesForCurrentView();
-    if (settings().triageOnly && !rowsAll.length && (S.stats.selected || S.selectedRows.length || S.parsedCaptures.length)) {
-      e.innerHTML = trustedHtml('<em>No incomplete captures found.</em>');
+    if (settings().triageOnly) {
+      const rowsAll = capturesForCurrentView();
+      if (!rowsAll.length && (S.stats.selected || S.selectedRows.length || S.parsedCaptures.length)) {
+        e.innerHTML = trustedHtml('<em>No incomplete captures found.</em>');
+        updateCapturesTitle();
+        return;
+      }
+      for (const cap of rowsAll) {
+        const key = captureKey(cap);
+        const idx = selectedIndexForKey(key);
+        e.appendChild(captureNodeForSlot({ row: null, cap, key, index: Number.isFinite(idx) ? idx : rowsAll.indexOf(cap) }));
+      }
       updateCapturesTitle();
       return;
     }
-    const rows = rowsAll.length > 250 ? rowsAll.slice(-250) : rowsAll;
-    rows.forEach(renderCapture);
+    const slots = selectedCaptureSlots();
+    if (!slots.length && !(S.parsedCaptures || []).length) {
+      updateCapturesTitle();
+      return;
+    }
+    for (const slot of slots) e.appendChild(captureNodeForSlot(slot));
+    if (S.capturesAuto) e.scrollTop = e.scrollHeight;
     updateCapturesTitle();
   }
 
   function logClass(row) {
     const t = String(row && row.type || '').toLowerCase();
     const m = String(row && row.message || '').toLowerCase();
+    if (/stop|stopped|cancel/.test(t) || /stopped by user|stop requested|cancelled/.test(m)) return 'logline logBad';
+    if (/pause|paused/.test(t) || /pause requested|pause already/.test(m)) return 'logline logWarn';
+    if (/resume|resumed/.test(t) || /resume clicked|continuing queued/.test(m)) return 'logline logInfo';
     if (/error|failed|snapshot-http-failed/.test(t) || /http 5\d\d|http 4\d\d|error|failed/.test(m)) return 'logline logBad';
     if (/retry|throttle|5xx|discarded|warn/.test(t) || /retry|throttle|5xx|discard/.test(m)) return 'logline logWarn';
     if (/done|success|copied|exported/.test(t) || /complete|copied|exported/.test(m)) return 'logline logGood';
-    if (/cdx|cache|query|debug|reload|restart|raw-cdx/.test(t)) return 'logline logInfo';
+    if (/cdx|cache|query|debug|reload|restart|raw-cdx|seed/.test(t)) return 'logline logInfo';
     return 'logline';
   }
 
@@ -5100,7 +7244,17 @@ async function copyBadCaptureUrls() {
     const head = document.createElement('span');
     head.textContent = `[${row.time}] ${row.type}: ${row.message}`;
     line.appendChild(head);
-    if (row.data && row.data.waybackUrl) {
+    appendLogLinks(line, row);
+    e.appendChild(line);
+    while (e.childNodes.length > 180) e.removeChild(e.firstChild);
+    if (S.logAuto) e.scrollTop = e.scrollHeight;
+    const zoom = document.getElementById('logZoomBody');
+    if (zoom) { renderLogLineInto(zoom, row); if (S.logZoomAuto) zoom.scrollTop = zoom.scrollHeight; }
+  }
+
+  function appendLogLinks(line, row) {
+    if (!line || !row || !row.data) return;
+    if (row.data.waybackUrl) {
       line.appendChild(document.createTextNode(' '));
       const a = document.createElement('a');
       a.href = row.data.waybackUrl;
@@ -5109,7 +7263,7 @@ async function copyBadCaptureUrls() {
       a.textContent = 'Wayback ↗';
       line.appendChild(a);
     }
-    if (row.data && row.data.cdxUrl) {
+    if (row.data.cdxUrl) {
       line.appendChild(document.createTextNode(' '));
       const a = document.createElement('a');
       a.href = row.data.cdxUrl;
@@ -5118,13 +7272,51 @@ async function copyBadCaptureUrls() {
       a.textContent = 'CDX ↗';
       line.appendChild(a);
     }
+    if (Array.isArray(row.data.thumbLinks)) {
+      for (const link of row.data.thumbLinks) {
+        if (!link || !link.url) continue;
+        line.appendChild(document.createTextNode(' '));
+        const a = document.createElement('a');
+        a.href = link.url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = link.label || 'thumb ↗';
+        line.appendChild(a);
+      }
+    }
+  }
+
+  function renderLogLineInto(e, row) {
+    if (!e || !row) return;
+    const line = document.createElement('div');
+    line.className = logClass(row);
+    const head = document.createElement('span');
+    head.textContent = `[${row.time}] ${row.type}: ${row.message}`;
+    line.appendChild(head);
+    appendLogLinks(line, row);
     e.appendChild(line);
-    while (e.childNodes.length > 180) e.removeChild(e.firstChild);
-    e.scrollTop = e.scrollHeight;
+    while (e.childNodes.length > 1000) e.removeChild(e.firstChild);
+  }
+
+  function showLogZoom() {
+    document.getElementById('logZoomOverlay')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'logZoomOverlay';
+    overlay.innerHTML = trustedHtml(`<div id="logZoomBox"><div id="logZoomHead"><b>WYSC Logs</b><span><button id="logZoomCopy">Copy logs</button> <button id="logZoomClose">Close</button></span></div><div id="logZoomBody"></div></div>`);
+    document.body.appendChild(overlay);
+    const body = overlay.querySelector('#logZoomBody');
+    for (const row of S.logs || []) renderLogLineInto(body, row);
+    body.scrollTop = body.scrollHeight;
+    S.logZoomAuto = true;
+    body.addEventListener('scroll', () => { S.logZoomAuto = body.scrollTop + body.clientHeight >= body.scrollHeight - 8; });
+    overlay.querySelector('#logZoomClose').onclick = () => overlay.remove();
+    overlay.querySelector('#logZoomCopy').onclick = () => copyLogs();
   }
 
   function renderVideoList() {
     const e = document.getElementById('videoList'); if (!e) return;
+    const preserveX = window.scrollX;
+    const preserveY = window.scrollY;
     const st = settings();
     const groups = [];
     const displayCaptures = capturesForCurrentView();
@@ -5137,6 +7329,10 @@ async function copyBadCaptureUrls() {
           const canonical = S.videos.get(item.id) || item;
           const isFirstOccurrence = item._wytscFirstOccurrence === true || (item._wytscFirstOccurrence == null && canonical.firstSeen === item.timestamp);
           if (!st.showDedupes && !isFirstOccurrence) { hiddenDupes++; continue; }
+          const onlyStatus = normalizeShowOnlyStatus(st);
+          const videoStatusForFilter = deriveVideoStatusFromEvidence(canonical).status;
+          if (onlyStatus === 'available' && videoStatusForFilter !== 'Available') { hiddenDupes++; continue; }
+          if (onlyStatus === 'unavailable' && videoStatusForFilter !== 'Unavailable') { hiddenDupes++; continue; }
           // Keep occurrence metadata historical (title/uploader/duration/views/parser/pageThumb from this capture),
           // but share expensive per-video thumbnail/live-status verification from the canonical VideoState.
           const cached2oe = getStore(status2oeCacheKey(item.id), null);
@@ -5145,22 +7341,30 @@ async function copyBadCaptureUrls() {
             resolved_2oe_url: canonical.resolved_2oe_url || item.resolved_2oe_url || (cached2oe && cached2oe.resolved_2oe_url) || '',
             occurrences: canonical.occurrences || item.occurrences || [],
             duplicate: !isFirstOccurrence,
-            videoStatus: canonical.videoStatus || item.videoStatus || 'Thumbnail not checked',
-            thumbnailStatus: canonical.thumbnailStatus || item.thumbnailStatus || ((item.pageThumb || canonical.pageThumb) ? 'Parsed thumbnail URL found' : 'No thumbnail source selected'),
-            thumbnailReason: canonical.thumbnailReason || item.thumbnailReason || ((item.pageThumb || canonical.pageThumb) ? 'thumbnail URL was parsed from the page; image load is not verified until fallback checks are enabled' : 'thumbnail not checked yet'),
-            displayThumb: canonical.displayThumb || item.displayThumb || item.pageThumb || canonical.pageThumb,
-            usedPreviewThumb: canonical.usedPreviewThumb || item.usedPreviewThumb || ((item.pageThumb || canonical.pageThumb) ? 'parsed page thumbnail URL' : 'unchecked'),
+            videoStatus: deriveVideoStatusFromEvidence(canonical).status,
+            videoStatusReason: deriveVideoStatusFromEvidence(canonical).reason,
+            thumbnailStatus: canonical.thumbnailStatus || item.thumbnailStatus || 'Archived thumb waiting',
+            thumbnailReason: canonical.thumbnailReason || item.thumbnailReason || 'waiting for live 0.jpg status check; archived fallback/CDX not checked',
+            displayThumb: canonical.displayThumb || item.displayThumb || makeDirectThumb(item.id),
+            usedPreviewThumb: canonical.usedPreviewThumb || item.usedPreviewThumb || 'live 0.jpg unavailable placeholder',
             thumbDebug: canonical.thumbDebug || item.thumbDebug || []
           }));
         }
       }
+      const onlyStatusForGroup = normalizeShowOnlyStatus(st);
+      if (onlyStatusForGroup !== 'all' && !cards.length) continue;
       groups.push({ cap, cards, hiddenDupes });
     }
     if (!groups.length) {
       const hasAnyLoaded = !!(S.parsedCaptures.length || S.selectedRows.length || S.stats.selected);
-      const msg = settings().triageOnly && hasAnyLoaded
-        ? 'No incomplete captures found.'
-        : 'No captures scanned yet. The scan may still be loading CDX or snapshots.';
+      const onlyStatusEmpty = normalizeShowOnlyStatus(settings());
+      const msg = onlyStatusEmpty === 'available' && hasAnyLoaded
+        ? 'No available videos found.'
+        : (onlyStatusEmpty === 'unavailable' && hasAnyLoaded
+          ? 'No unavailable videos found.'
+          : (settings().triageOnly && hasAnyLoaded
+            ? 'No incomplete captures found.'
+            : 'No captures scanned yet. The scan may still be loading CDX or snapshots.'));
       e.innerHTML = trustedHtml(`<div class="empty">${escapeHtml(msg)}</div>`);
       return;
     }
@@ -5169,7 +7373,7 @@ async function copyBadCaptureUrls() {
       link.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
-        switchSeedFromThumbnail(ev.currentTarget.dataset.id);
+        switchSeedFromThumbnail(ev.currentTarget.dataset.id, ev.currentTarget.dataset.title || '');
       });
       link.addEventListener('auxclick', ev => { if (ev.button === 1) { ev.preventDefault(); window.open(`https://www.youtube.com/watch?v=${ev.currentTarget.dataset.id}`, '_blank'); } });
       link.addEventListener('contextmenu', ev => { S.activeImageUrl = ev.currentTarget.href; });
@@ -5181,24 +7385,44 @@ async function copyBadCaptureUrls() {
         if (v) check2oe(v);
       });
     });
+    e.querySelectorAll('.checkCdxThumbBtn').forEach(btn => {
+      btn.addEventListener('click', async ev => {
+        ev.preventDefault();
+        const v = S.videos.get(btn.dataset.id);
+        if (v) await checkCdxThumb(v, { manual: true, retry: true });
+      });
+    });
     e.querySelectorAll('.copyParseDebugBtn').forEach(btn => {
       btn.addEventListener('click', ev => {
         ev.preventDefault();
         copySingleParseDebug(btn.dataset.key);
       });
     });
+    e.querySelectorAll('.copyFetchedHtmlBtn').forEach(btn => {
+      btn.addEventListener('click', ev => {
+        ev.preventDefault();
+        copyFetchedHtmlForTimestamp(btn.dataset.ts);
+      });
+    });
+    // Rendering new groups must not drag the main video-card page around.
+    // Explicit Jump buttons still scroll intentionally.
+    if (window.scrollX !== preserveX || window.scrollY !== preserveY) {
+      window.scrollTo(preserveX, preserveY);
+    }
+    runPendingSeedScrollRestore();
   }
 
   function captureGroup(g) {
     const cap = g.cap;
     const hidden = g.hiddenDupes ? ` · ${g.hiddenDupes} hidden duplicates` : '';
-    const recovered = cap.recoveredFrom ? ` · recovered from ${cap.recoveredFrom}` : '';
-    const status = cap.ok ? `${(cap.items || []).length} parsed${hidden}${recovered}` : escapeHtml(cap.reason || 'failed');
-    const emptyText = cap.ok ? (g.hiddenDupes ? `${g.hiddenDupes} duplicate card(s) hidden by Show dedupes OFF.` : 'No parsed cards for this capture.') : 'Snapshot failed. Use Retry in Scanned captures.';
-    return `<section id="${escapeAttr(captureDomId(cap.timestamp))}" class="captureGroup ${cap.ok ? '' : 'captureFailed'}">
+    const retryHtml = captureRetryStatusHtml(cap);
+    const status = cap.ok ? `${escapeHtml(`${(cap.items || []).length} parsed${hidden}`)}${retryHtml}` : `${escapeHtml(cap.reason || 'failed')}${retryHtml}`;
+    const emptyText = cap.ok ? (g.hiddenDupes ? `${g.hiddenDupes} duplicate card(s) hidden by Show dedupes OFF.` : 'No parsed cards for this capture.') : (cap.retryQueued ? 'Snapshot is queued for retry.' : 'Snapshot failed. Use Retry in Scanned captures.');
+    return `<section id="${escapeAttr(captureDomId(cap.timestamp))}" class="captureGroup ${cap.ok ? '' : (cap.retryQueued ? 'captureRetryQueued' : 'captureFailed')}">
       <div class="captureHead">
         <a target="_blank" rel="noopener noreferrer" href="${escapeAttr(cap.page)}">${escapeHtml(displayTimestamp(cap.timestamp))} ↗</a>
         <span>${status}</span>
+        <button class="copyFetchedHtmlBtn" data-ts="${escapeAttr(cap.timestamp || '')}" title="Copy exact fetched/saved HTML for this capture">Copy RAW HTML</button>
         <code>${escapeHtml(cap.original || '')}</code>
       </div>
       <div class="captureGrid">${g.cards.map(v => videoCard(v, cap)).join('') || `<div class="empty small">${escapeHtml(emptyText)}</div>`}</div>
@@ -5214,10 +7438,15 @@ async function copyBadCaptureUrls() {
       if (/available|live/.test(v)) return 'dbgGood';
       if (/pending|checking/.test(v)) return 'dbgWarn';
     }
+    if (k.includes('video reason')) {
+      if (/120x90|placeholder|403|404|timeout|failed|-1/.test(v)) return 'dbgWarn';
+      if (/loaded|0\.jpg|archived|redirect|dimensions/.test(v)) return 'dbgGood';
+      return 'dbgInfo';
+    }
     if (k.includes('thumb status')) {
-      if (/live hqdefault|archived page|timestamp default|usable/.test(v)) return 'dbgGood';
-      if (/failed|bad|missing|error/.test(v)) return 'dbgBad';
-      if (/fallback skipped|pending|checking/.test(v)) return 'dbgWarn';
+      if (/live 0.jpg loaded|fallback page thumb|fallback timestamp thumb|usable/.test(v)) return 'dbgGood';
+      if (/fallback failed|failed|bad|missing|error/.test(v)) return 'dbgBad';
+      if (/fallback queued|checking|placeholder|pending|not checked|cdx/.test(v)) return 'dbgWarn';
     }
     if (k.includes('2oe status')) {
       if (/302|archived|redirect/.test(v)) return 'dbg2oeGood';
@@ -5227,9 +7456,10 @@ async function copyBadCaptureUrls() {
       return 'dbg2oeUnchecked';
     }
     if (k.includes('thumb reason')) {
-      if (/failed|bad|4xx|5xx|missing|error/.test(v)) return 'dbgBad';
-      if (/120x90|fallback checks off|pending|not reached/.test(v)) return 'dbgWarn';
-      return 'dbgGood';
+      if (/bad hash|failed|4xx|5xx|missing|error/.test(v)) return 'dbgBad';
+      if (/good hash|dimensions|loaded/.test(v)) return 'dbgGood';
+      if (/120x90|fallback checks off|pending|not reached|waiting|trying|loading/.test(v)) return 'dbgWarn';
+      return 'dbgInfo';
     }
     if (k.includes('parser')) {
       if (/generic|stringfallback|unknown/.test(v)) return 'dbgWarn';
@@ -5240,7 +7470,8 @@ async function copyBadCaptureUrls() {
       return 'dbgInfo';
     }
     if (k.includes('used preview')) {
-      if (/placeholder|120x90/.test(v)) return 'dbgWarn';
+      if (/page thumb|timestamp thumb/.test(v)) return 'dbgGood';
+      if (/placeholder|unavailable|120x90/.test(v)) return 'dbgWarn';
       return 'dbgInfo';
     }
     if (k.includes('occurrences') && Number(value) > 1) return 'dbgWarn';
@@ -5249,37 +7480,39 @@ async function copyBadCaptureUrls() {
 
   function videoCard(v, cap) {
     const st = settings();
-    const thumb = v.thumbKind === 'mobile-sprite' && v.spriteUrl ? v.spriteUrl : (st.fallbackThumbnails ? (v.displayThumb || v.pageThumb || makeDirectThumb(v.id)) : makeDirectThumb(v.id));
+    const thumb = v.thumbKind === 'mobile-sprite' && v.spriteUrl ? v.spriteUrl : (v.displayThumb || makeDirectThumb(v.id));
     const occ = v.occurrences || [{ timestamp: v.timestamp, captureUrl: v.captureUrl, parser: v.parser }];
     const dup = v.duplicate ? '<span class="badge warn">DUPE</span>' : (occ.length > 1 ? `<span class="badge">${occ.length}x</span>` : '');
     const missing = value => {
       const s = cleanText(value || '');
       return s ? s : '?';
     };
-    const effectiveThumbStatus = v.thumbnailStatus || 'Checking hqdefault';
-    const effectiveUsedPreview = v.usedPreviewThumb || 'live hqdefault (checking)';
+    const effectiveThumbStatus = v.thumbnailStatus || (v.liveThumb ? 'No archived thumb checked' : 'Live preview pending');
+    const effectiveUsedPreview = v.usedPreviewThumb || (v.liveThumb && String(v.liveThumb.liveStatus || '').toLowerCase() === 'live' ? 'live 0.jpg' : 'live 0.jpg placeholder');
     const debugRows = [
-      ['Video status', v.videoStatus || 'Pending'],
+      ['Video status', deriveVideoStatusFromEvidence(v).status || v.videoStatus || 'Pending'],
+      ['Video reason', deriveVideoStatusFromEvidence(v).reason || v.videoStatusReason || ''],
       ['Source', v.source || (cap && cap.cdxSource) || 'desktop'],
       ['Parser', v.parser || 'unknown'],
       ['Capture', displayTimestamp(v.timestamp || (cap && cap.timestamp) || '')],
       ['Thumb status', effectiveThumbStatus],
-      ['Thumb reason', v.thumbnailReason || 'thumbnail verification not reached yet'],
+      ['Thumb reason', v.thumbnailReason || (v.liveThumb ? 'archived fallback/CDX not checked' : 'waiting for live 0.jpg status check')],
       ['Used preview thumb', effectiveUsedPreview],
       ['Parsed page thumb', v.pageThumb || 'missing'],
       ['2oe status', v.status_2oe || 'unchecked'],
+      ['CDX thumb', v.cdxThumb && v.cdxThumb.status === 'found' ? `found length ${v.cdxThumb.length || '?'}` : (v.cdxThumb && v.cdxThumb.status ? v.cdxThumb.status : 'unchecked')],
       ['Occurrences', String(occ.length || 1)]
     ];
-    const thumbDebug = (v.thumbDebug || []).map(x => `<div class="debugLine"><b>${escapeHtml(x.kind || '')}</b>: ${escapeHtml(x.dims ? x.dims.width+'x'+x.dims.height : '?')} status=${escapeHtml(x.status || '')} hash=${escapeHtml(x.hash || '')} ${escapeHtml(x.reason || '')}</div>`).join('');
-    return `<article class="card ${v.duplicate ? 'dupeCard' : ''}">
-      <a class="thumbLink" href="${escapeAttr(thumb)}" target="_blank" rel="noopener noreferrer" data-id="${escapeAttr(v.id)}" title="Hover: preview image URL. Left click: switch starting video. Middle click: open video in new tab. Right click: image context menu.">${v.thumbKind === 'mobile-sprite' && v.spriteUrl ? `<div class="thumb mobileSpriteThumb" style="background-image:url('${escapeAttr(v.spriteUrl)}');background-position:-${Number(v.spriteX||0)}px -${Number(v.spriteY||0)}px;background-size:auto;width:${Number(v.tileW||120)}px;height:${Number(v.tileH||90)}px"></div>` : `<img class="thumb" src="${escapeAttr(thumb)}" loading="lazy">`}</a>
+    const thumbMode = /checking cdx thumb|cdx queued/i.test(String(effectiveThumbStatus || '')) ? 'cdx' : (/fallback queued|checking page thumb|checking timestamp thumb/i.test(String(effectiveThumbStatus || '')) ? 'fallback' : '');
+    const thumbQueueClass = thumbMode ? ' thumbQueueItem' : '';
+    return `<article class="card ${v.duplicate ? 'dupeCard' : ''}${thumbQueueClass}" data-thumb-queue="${thumbQueueClass ? '1' : ''}" data-thumb-mode="${escapeAttr(thumbMode)}" data-id="${escapeAttr(v.id)}">
+      <a class="thumbLink" href="${escapeAttr(thumb)}" target="_blank" rel="noopener noreferrer" data-id="${escapeAttr(v.id)}" data-title="${escapeAttr(v.title || '')}" title="Hover: preview image URL. Left click: switch starting video. Middle click: open video in new tab. Right click: image context menu.">${v.thumbKind === 'mobile-sprite' && v.spriteUrl ? `<div class="thumb mobileSpriteThumb" style="background-image:url('${escapeAttr(v.spriteUrl)}');background-position:-${Number(v.spriteX||0)}px -${Number(v.spriteY||0)}px;background-size:auto;width:${Number(v.tileW||120)}px;height:${Number(v.tileH||90)}px"></div>` : `<img class="thumb" src="${escapeAttr(thumb)}" loading="lazy" width="260" height="146">`}</a>
       <div class="meta">
         <h3>${escapeHtml(v.title || '(no title)')} ${dup}</h3>
         <div class="mainMeta"><code>${escapeHtml(v.id)}</code> · <a target="_blank" rel="noopener noreferrer" href="https://www.youtube.com/watch?v=${escapeAttr(v.id)}">Live</a> · <a target="_blank" rel="noopener noreferrer" href="${escapeAttr(make2oeUrl(v.id))}">2oe ↗</a> · ${escapeHtml(v.durationUnavailableReason === 'live' ? 'LIVE' : missing(v.duration))} · ${escapeHtml(v.views ? v.views + ' views' : (v.viewsUnavailableReason ? '[' + v.viewsUnavailableReason + ']' : '?'))}</div>
         <div class="uploader">${escapeHtml(missing(v.uploader))}</div>
-        <button class="copyParseDebugBtn" data-key="${escapeAttr(v._wytscItemKey || '')}" title="Copy parser/debug snippet for this card">Copy parse debug</button> <button class="check2oeBtn" data-id="${escapeAttr(v.id)}" title="Check 2oe redirect for archived playback">Check 2oe</button>
+        <button class="copyParseDebugBtn" data-key="${escapeAttr(v._wytscItemKey || '')}" title="Copy parser/debug snippet for this card">Copy parse debug</button> <button class="check2oeBtn" data-id="${escapeAttr(v.id)}" title="Check 2oe redirect for archived playback">Check 2oe</button> <button class="checkCdxThumbBtn" data-id="${escapeAttr(v.id)}" ${deriveVideoStatusFromEvidence(v).status === 'Available' ? 'disabled title="Skipped for Available live videos"' : 'title="Find largest archived thumbnail from CDX"'}>CDX Thumb</button>
         <div class="debugGrid">${debugRows.map(([k,val]) => `<div><b>${escapeHtml(k)}</b></div><div class="${debugClass(k, val)}">${escapeHtml(val)}</div>`).join('')}</div>
-        ${thumbDebug ? `<div class="thumbDebug">${thumbDebug}</div>` : ''}
       </div>
     </article>`;
   }
@@ -5354,20 +7587,201 @@ async function copyBadCaptureUrls() {
     log('debug', `Copied parser debug ${missingOnly ? 'for missing fields only' : 'for all cards'}: ${rows.length} row(s)`);
   }
 
+
+  function makeCaptureOrderAudit() {
+    const selectedRows = (S.selectedRows || []).slice();
+    const captures = (S.parsedCaptures || []).slice();
+    const selectedByKey = new Map();
+    selectedRows.forEach((row, i) => {
+      const k = selectedRowKey(row);
+      if (!selectedByKey.has(k)) selectedByKey.set(k, []);
+      selectedByKey.get(k).push({ index: i, timestamp: row.timestamp, source: row.source || row.cdxSource || 'desktop', original: row.original || '', key: k });
+    });
+    const capByKey = new Map();
+    captures.forEach((cap, i) => {
+      const k = captureKey(cap);
+      if (!capByKey.has(k)) capByKey.set(k, []);
+      capByKey.get(k).push(cap);
+    });
+    const ordered = orderedCapturesBySelectedPlan(captures);
+    const orderedIndexByKey = new Map();
+    ordered.forEach((cap, i) => { if (!orderedIndexByKey.has(captureKey(cap))) orderedIndexByKey.set(captureKey(cap), i); });
+
+    const domRows = [];
+    const domCounterCounts = new Map();
+    const domKeyCounts = new Map();
+    const capBox = document.getElementById('captures');
+    if (capBox) {
+      capBox.querySelectorAll('.cap').forEach((node, i) => {
+        const key = node.dataset ? String(node.dataset.capKey || '') : '';
+        const counterText = (node.querySelector('.capCount') && node.querySelector('.capCount').textContent || '').trim();
+        const m = /^\((\d+)\/(\d+|\?)\)$/.exec(counterText);
+        const timestampText = (node.querySelector('a') && node.querySelector('a').textContent || '').trim();
+        const row = { domIndex: i, key, counterText, displayedIndex: m ? Number(m[1]) - 1 : null, displayedTotal: m ? m[2] : null, timestampText };
+        domRows.push(row);
+        if (m) domCounterCounts.set(m[1], (domCounterCounts.get(m[1]) || 0) + 1);
+        if (key) domKeyCounts.set(key, (domKeyCounts.get(key) || 0) + 1);
+      });
+    }
+    const domByKey = new Map();
+    domRows.forEach(r => { if (r.key && !domByKey.has(r.key)) domByKey.set(r.key, r); });
+
+    const captureRows = captures.map((cap, parsedOrderIndex) => {
+      const key = captureKey(cap);
+      const selectedMatches = selectedByKey.get(key) || [];
+      const expectedIndex = selectedMatches.length ? selectedMatches[0].index : null;
+      const orderedIndex = orderedIndexByKey.has(key) ? orderedIndexByKey.get(key) : null;
+      const dom = domByKey.get(key) || null;
+      const issues = [];
+      if (!selectedMatches.length) issues.push('not-in-current-selected-plan');
+      if (selectedMatches.length > 1) issues.push('duplicate-selected-key');
+      if ((capByKey.get(key) || []).length > 1) issues.push('duplicate-capture-key');
+      if (Number.isFinite(cap._selectedIndex) && expectedIndex != null && Number(cap._selectedIndex) !== expectedIndex) issues.push('stale-cap-_selectedIndex');
+      if (!dom && orderedIndex != null && expectedIndex != null && orderedIndex !== expectedIndex) issues.push('ordered-index-mismatch');
+      if (dom && dom.displayedIndex != null && expectedIndex != null && dom.displayedIndex !== expectedIndex) issues.push('dom-counter-mismatch');
+      if (dom && dom.domIndex != null && expectedIndex != null && dom.domIndex !== expectedIndex) issues.push('dom-row-order-mismatch');
+      if (!dom) issues.push('missing-dom-row');
+      return {
+        key,
+        timestamp: cap.timestamp || '',
+        source: cap.cdxSource || cap.source || 'desktop',
+        ok: !!cap.ok,
+        status: cap.status,
+        parsedCount: ((cap.items || []).length),
+        sourceLabel: cap.source || cap.cdxSource || '',
+        parsedOrderIndex,
+        capSelectedIndex: Number.isFinite(cap._selectedIndex) ? Number(cap._selectedIndex) : null,
+        expectedIndex,
+        expectedCounter: expectedIndex == null ? null : `(${expectedIndex + 1}/${selectedRows.length || '?'})`,
+        orderedIndex,
+        domIndex: dom ? dom.domIndex : null,
+        domCounter: dom ? dom.counterText : '',
+        domTimestampText: dom ? dom.timestampText : '',
+        selectedMatches: selectedMatches.length,
+        captureKeyCopies: (capByKey.get(key) || []).length,
+        issues
+      };
+    });
+
+    const selectedRowsAudit = selectedRows.map((row, i) => {
+      const key = selectedRowKey(row);
+      const caps = capByKey.get(key) || [];
+      const dom = domByKey.get(key) || null;
+      return {
+        expectedIndex: i,
+        expectedCounter: `(${i + 1}/${selectedRows.length || '?'})`,
+        key,
+        timestamp: row.timestamp || '',
+        source: row.source || row.cdxSource || 'desktop',
+        original: row.original || '',
+        captureCount: caps.length,
+        domCounter: dom ? dom.counterText : '',
+        domIndex: dom ? dom.domIndex : null,
+        status: caps[0] ? caps[0].status : null,
+        parsedCount: caps[0] ? ((caps[0].items || []).length) : null
+      };
+    });
+
+    const duplicateDomCounters = [...domCounterCounts.entries()].filter(([, n]) => n > 1).map(([counter, count]) => ({ counter, count }));
+    const duplicateDomKeys = [...domKeyCounts.entries()].filter(([, n]) => n > 1).map(([key, count]) => ({ key, count }));
+    const duplicateCaptureKeys = [...capByKey.entries()].filter(([, arr]) => arr.length > 1).map(([key, arr]) => ({ key, count: arr.length, timestamps: arr.map(c => c.timestamp) }));
+    const duplicateSelectedKeys = [...selectedByKey.entries()].filter(([, arr]) => arr.length > 1).map(([key, arr]) => ({ key, count: arr.length, indexes: arr.map(x => x.index), timestamps: arr.map(x => x.timestamp) }));
+    const problemRows = captureRows.filter(r => r.issues.length);
+    const pendingPlaceholderRows = selectedRowsAudit.filter(r => !r.captureCount && r.domCounter);
+    const missingSelectedRows = selectedRowsAudit.filter(r => !r.domCounter);
+
+    return {
+      appVersion: APP.version,
+      seed: S.seed,
+      sourceMode: S.sourceMode,
+      timestamp: new Date().toISOString(),
+      selectedTotal: selectedRows.length,
+      parsedCaptureTotal: captures.length,
+      renderedDomRows: domRows.length,
+      statsSelected: S.stats && S.stats.selected,
+      statsScanned: S.stats && S.stats.scanned,
+      settings: { mode: settings().mode, minYear: settings().minYear, minMonth: settings().minMonth, maxYear: settings().maxYear, maxMonth: settings().maxMonth, triageOnly: !!settings().triageOnly },
+      summary: {
+        problemRows: problemRows.length,
+        missingSelectedRows: missingSelectedRows.length,
+        pendingPlaceholderRows: pendingPlaceholderRows.length,
+        duplicateDomCounters: duplicateDomCounters.length,
+        duplicateDomKeys: duplicateDomKeys.length,
+        duplicateCaptureKeys: duplicateCaptureKeys.length,
+        duplicateSelectedKeys: duplicateSelectedKeys.length
+      },
+      duplicateDomCounters,
+      duplicateDomKeys,
+      duplicateCaptureKeys,
+      duplicateSelectedKeys,
+      problemRows,
+      missingSelectedRows: missingSelectedRows.slice(0, 200),
+      pendingPlaceholderRows: pendingPlaceholderRows.slice(0, 200),
+      domRows,
+      captureRows,
+      selectedRowsAudit
+    };
+  }
+
+  function formatCaptureOrderAudit(audit) {
+    const lines = [];
+    lines.push(`${APP.name} ${APP.version}`);
+    lines.push(`Capture Order Audit`);
+    lines.push(`seed: ${audit.seed}`);
+    lines.push(`selectedTotal: ${audit.selectedTotal}`);
+    lines.push(`parsedCaptureTotal: ${audit.parsedCaptureTotal}`);
+    lines.push(`renderedDomRows: ${audit.renderedDomRows}`);
+    lines.push(`summary: ${JSON.stringify(audit.summary)}`);
+    lines.push('');
+    if (audit.duplicateDomCounters.length) {
+      lines.push('DUPLICATE DOM COUNTERS:');
+      for (const x of audit.duplicateDomCounters) lines.push(`  (${x.counter}/${audit.selectedTotal}) appears ${x.count} times`);
+      lines.push('');
+    }
+    if (audit.duplicateCaptureKeys.length) {
+      lines.push('DUPLICATE CAPTURE KEYS:');
+      for (const x of audit.duplicateCaptureKeys.slice(0, 50)) lines.push(`  ${x.key} copies=${x.count}`);
+      lines.push('');
+    }
+    if (audit.problemRows.length) {
+      lines.push('PROBLEM CAPTURE ROWS:');
+      for (const r of audit.problemRows.slice(0, 120)) {
+        lines.push(`  ts=${r.timestamp} key=${r.key}`);
+        lines.push(`    expected=${r.expectedCounter || '?'} cap._selectedIndex=${r.capSelectedIndex == null ? '?' : r.capSelectedIndex} orderedIndex=${r.orderedIndex == null ? '?' : r.orderedIndex} domIndex=${r.domIndex == null ? '?' : r.domIndex} domCounter=${r.domCounter || '?'}`);
+        lines.push(`    issues=${r.issues.join(', ')}`);
+      }
+      lines.push('');
+    }
+    lines.push('JSON:');
+    lines.push(JSON.stringify(audit, null, 2));
+    return lines.join('\n');
+  }
+
+  async function copyCaptureOrderAudit() {
+    const audit = makeCaptureOrderAudit();
+    const text = formatCaptureOrderAudit(audit);
+    try { await navigator.clipboard.writeText(text); } catch (e) { log('capture-order-audit-error', `Could not copy audit to clipboard: ${e && (e.message || e)}`); }
+    const firstProblems = (audit.problemRows || []).slice(0, 20).map(r => ({ timestamp: r.timestamp, key: r.key, expectedCounter: r.expectedCounter, capSelectedIndex: r.capSelectedIndex, orderedIndex: r.orderedIndex, domIndex: r.domIndex, domCounter: r.domCounter, issues: r.issues }));
+    log(audit.summary.problemRows || audit.summary.duplicateDomCounters || audit.summary.duplicateCaptureKeys ? 'capture-order-audit-warn' : 'capture-order-audit',
+      `Capture order audit copied: ${audit.summary.problemRows} problem row(s), ${audit.summary.duplicateDomCounters} duplicate DOM counter(s), ${audit.summary.duplicateCaptureKeys} duplicate capture key(s)`,
+      { summary: audit.summary, selectedTotal: audit.selectedTotal, parsedCaptureTotal: audit.parsedCaptureTotal, renderedDomRows: audit.renderedDomRows, duplicateDomCounters: audit.duplicateDomCounters, firstProblems });
+  }
+
   function makeDebugReport() {
     return {
-      app: APP,
+      app: Object.assign({}, APP, { badHashes: '[set omitted]' }),
       settings: settings(),
       seed: S.seed,
       cdxUrl: buildCdxUrl(S.seed),
       stats: S.stats,
-      discarded: S.discarded,
+      discarded: (S.discarded || []).slice(0, 500),
       captures: S.parsedCaptures.map(c => ({ timestamp: c.timestamp, original: c.original, page: c.page, ok: c.ok, status: c.status, reason: c.reason, count: c.items ? c.items.length : 0 })),
-      videos: [...S.videos.values()],
-      duplicates: S.dupes,
-      logs: S.logs
+      videos: [...S.videos.values()].map(v => { const x = Object.assign({}, v); delete x.parseDebug; return x; }),
+      duplicates: (S.dupes || []).slice(0, 500),
+      logs: (S.logs || []).slice(-APP.maxLogEntries)
     };
   }
+
   async function copyDebugReport() {
     const report = makeDebugReport();
     const text = `${APP.name} ${APP.version}\nSeed: ${S.seed}\nStats: ${JSON.stringify(S.stats, null, 2)}\n\nJSON:\n${JSON.stringify(report, null, 2)}`;
@@ -5396,6 +7810,220 @@ async function copyBadCaptureUrls() {
   }
 
 
+
+  function sanitizeExportName(value) {
+    return String(value || 'unknown').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'unknown';
+  }
+
+  function rowMatchesTimestamp(row, timestamp) {
+    return row && String(row.timestamp || '') === String(timestamp || '');
+  }
+
+  function rowSource(row) {
+    return (row && (row.source || row.cdxSource)) || 'desktop';
+  }
+
+  function findCaptureRowForHtml(timestamp) {
+    const ts = String(timestamp || '');
+    const pools = [
+      S.selectedRows || [],
+      S.cdxRows || []
+    ];
+    for (const pool of pools) {
+      for (const row of pool || []) {
+        if (rowMatchesTimestamp(row, ts)) return row;
+      }
+    }
+    for (const source of ['desktop', 'mobile']) {
+      const cached = getStore(`cdx:${source}:${S.seed}`, null);
+      if (!cached || !Array.isArray(cached.rows)) continue;
+      for (const row of cached.rows) {
+        if (rowMatchesTimestamp(row, ts)) return Object.assign({}, row, { source: row.source || source });
+      }
+    }
+    const cap = (S.parsedCaptures || []).find(c => rowMatchesTimestamp(c, ts));
+    if (cap) {
+      return {
+        timestamp: cap.timestamp,
+        original: cap.original || S.originalUrl || '',
+        digest: cap.digest || cap.original || '',
+        source: cap.cdxSource || cap.source || 'desktop'
+      };
+    }
+    return null;
+  }
+
+  async function fetchedHtmlEntryForRow(row) {
+    if (!row || !row.timestamp) return null;
+    const htmlKey = snapshotHtmlCacheKey(row);
+    const cached = await getSnapshotHtmlCache(row);
+    if (!cached || typeof cached.html !== 'string') return null;
+    const page = cached.page || snapshotUrl(row.timestamp, row.original || cached.original || S.originalUrl || '');
+    return {
+      row,
+      key: htmlKey,
+      cached,
+      source: rowSource(row),
+      timestamp: row.timestamp,
+      original: row.original || cached.original || '',
+      page,
+      html: cached.html
+    };
+  }
+
+  function fetchedHtmlHeader(entry) {
+    const cap = (S.parsedCaptures || []).find(c => rowMatchesTimestamp(c, entry.timestamp));
+    return [
+      'WYSC NEED REVIEWS HTML',
+      `app: ${APP.version}`,
+      `parserVersion: ${APP.parserVersion}`,
+      `seed: ${S.seed || ''}`,
+      `timestamp: ${entry.timestamp || ''}`,
+      `display_time: ${displayTimestamp(entry.timestamp || '')}`,
+      `source: ${entry.source || ''}`,
+      `original: ${entry.original || ''}`,
+      `fetch_url: ${entry.page || ''}`,
+      `storage_key: ${entry.key || ''}`,
+      `status: ${entry.cached && entry.cached.status != null ? entry.cached.status : ''}`,
+      `saved_at: ${entry.cached && entry.cached.savedAt ? new Date(entry.cached.savedAt).toISOString() : ''}`,
+      `html_chars: ${String(entry.html || '').length}`,
+      `parse_status: ${cap ? (cap.ok ? 'ok' : 'failed') : 'not currently rendered'}`,
+      `parser: ${cap && cap.items && cap.items[0] ? (cap.items[0].parser || '') : ''}`,
+      `issue_summary: ${entry.badRow && entry.badRow.issueSummary ? entry.badRow.issueSummary : ''}`,
+      '',
+      '--- HTML ---',
+      ''
+    ].join('\n');
+  }
+
+  async function copyFetchedHtmlForTimestamp(timestamp) {
+    const row = findCaptureRowForHtml(timestamp);
+    const entry = await fetchedHtmlEntryForRow(row);
+    if (!entry) {
+      const msg = `No cached raw HTML found for ${displayTimestamp(timestamp || '')}.`;
+      log('fetched-html-copy', msg, { seed: S.seed || '', timestamp: timestamp || '' });
+      alert(msg);
+      return;
+    }
+    await navigator.clipboard.writeText(fetchedHtmlHeader(entry) + entry.html);
+    log('fetched-html-copy', `Copied Need Reviews HTML for ${displayTimestamp(entry.timestamp)} (${entry.html.length} chars)`, {
+      seed: S.seed || '',
+      timestamp: entry.timestamp,
+      source: entry.source,
+      htmlChars: entry.html.length,
+      storageKey: entry.key,
+      waybackUrl: entry.page
+    });
+  }
+
+  async function fetchedHtmlEntriesForCurrentSeed() {
+    const rows = seedScopedRowsForCacheClear();
+    const entries = [];
+    const seen = new Set();
+    for (const row of rows) {
+      const entry = await fetchedHtmlEntryForRow(row);
+      if (!entry) continue;
+      const k = entry.key || `${entry.source}:${entry.timestamp}:${entry.original}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      entries.push(entry);
+    }
+    entries.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')) || String(a.source || '').localeCompare(String(b.source || '')));
+    return entries;
+  }
+
+  async function needsReviewHtmlEntriesForCurrentSeed() {
+    const rows = getBadCaptures();
+    const entries = [];
+    const seen = new Set();
+    for (const badRow of rows) {
+      const row = findCaptureRowForHtml(badRow.timestamp) || rowFromBadCapture(badRow);
+      let entry = await fetchedHtmlEntryForRow(row);
+      if (!entry) {
+        const cached = await getCachedHtmlForBadCapture(badRow);
+        if (!cached || typeof cached.html !== 'string') continue;
+        const page = badRow.page || snapshotUrl(badRow.timestamp, badRow.original || S.originalUrl || '');
+        entry = {
+          row,
+          key: cached._wyscKey || snapshotHtmlCacheKey(row),
+          cached,
+          source: rowSource(row),
+          timestamp: badRow.timestamp,
+          original: badRow.original || row.original || cached.original || '',
+          page,
+          html: cached.html,
+          badRow
+        };
+      } else {
+        entry.badRow = badRow;
+      }
+      const k = entry.key || `${entry.source}:${entry.timestamp}:${entry.original}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      entries.push(entry);
+    }
+    entries.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')) || String(a.source || '').localeCompare(String(b.source || '')));
+    return entries;
+  }
+
+  async function exportNeedsReviewHtml() {
+    if (!S.seed) {
+      alert('No seed selected.');
+      return;
+    }
+    const entries = await needsReviewHtmlEntriesForCurrentSeed();
+    if (!entries.length) {
+      const msg = 'No cached raw HTML found for this seed.';
+      log('fetched-html-export', msg, { seed: S.seed || '' });
+      alert(msg);
+      return;
+    }
+    const indexLines = [
+      'WYSC NEED REVIEWS HTML EXPORT INDEX',
+      `app: ${APP.version}`,
+      `parserVersion: ${APP.parserVersion}`,
+      `seed: ${S.seed || ''}`,
+      `exported_at: ${nowLocal()}`,
+      `saved_need_reviews_html: ${entries.length}`,
+      '',
+      ['timestamp', 'source', 'html_chars', 'status', 'original', 'fetch_url', 'storage_key', 'issue_summary'].join('\t')
+    ];
+    for (const e of entries) {
+      indexLines.push([
+        e.timestamp || '',
+        e.source || '',
+        String((e.html || '').length),
+        e.cached && e.cached.status != null ? String(e.cached.status) : '',
+        e.original || '',
+        e.page || '',
+        e.key || '',
+        e.badRow && e.badRow.issueSummary ? e.badRow.issueSummary : ''
+      ].map(v => String(v == null ? '' : v).replace(/\t/g, ' ')).join('\t'));
+    }
+    const parts = [
+      indexLines.join('\n'),
+      ''
+    ];
+    for (const e of entries) {
+      parts.push(
+        `\n\n===== BEGIN NEED REVIEWS HTML ${e.timestamp || ''} ${e.source || ''} =====\n`,
+        fetchedHtmlHeader(e),
+        e.html || '',
+        `\n===== END NEED REVIEWS HTML ${e.timestamp || ''} ${e.source || ''} =====\n`
+      );
+    }
+    const stamp = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+    const filename = `wysc_need_reviews_html_${sanitizeExportName(S.seed)}_${entries.length}captures_${stamp}.txt`;
+    downloadTextFile(filename, parts.join('\n'));
+    log('fetched-html-export', `Exported Need Reviews HTML text bundle: ${entries.length} capture(s)`, {
+      seed: S.seed || '',
+      filename,
+      captures: entries.length,
+      totalChars: parts.join('\n').length
+    });
+  }
+
+
   function downloadTextFile(filename, text) {
     const blob = new Blob([String(text == null ? '' : text)], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -5415,16 +8043,22 @@ async function copyBadCaptureUrls() {
     return sources.map(source => ({ source, key: `cdx:${source}:${S.seed}`, cached: getStore(`cdx:${source}:${S.seed}`, null) }));
   }
 
+  function cdxRowsToRawText(cached) {
+    if (!cached) return '';
+    if (typeof cached.rawText === 'string') return cached.rawText;
+    if (Array.isArray(cached.rows)) return cached.rows.map(r => r && r.rawLine ? r.rawLine : [r.urlkey, r.timestamp, r.original, r.mimetype, r.statuscode, r.digest, r.length].filter(v => v != null && v !== '').join(' ')).join('\n');
+    return '';
+  }
   function exportRawCdx() {
     if (!S.seed) {
       alert('No active seed.');
       return;
     }
     const entries = rawCdxCacheEntriesForCurrentSource();
-    const found = entries.filter(e => e.cached && typeof e.cached.rawText === 'string');
+    const found = entries.map(e => Object.assign({}, e, { rawExportText: cdxRowsToRawText(e.cached) })).filter(e => e.rawExportText);
     if (!found.length) {
       const tried = entries.map(e => e.key);
-      const msg = 'No raw CDX has been downloaded for this seed/source yet.';
+      const msg = 'No CDX rows have been downloaded for this seed/source yet.';
       log('raw-cdx-export', msg, { seed: S.seed, sourceMode: settings().sourceMode || 'desktop', triedKeys: tried, cdxUrl: buildCdxUrl(S.seed, settings().sourceMode === 'mobile' ? 'mobile' : 'desktop') });
       alert(`${msg}\n\nTried:\n${tried.join('\n')}`);
       return;
@@ -5433,27 +8067,125 @@ async function copyBadCaptureUrls() {
     if (found.length === 1) {
       const e = found[0];
       const filename = `cdx_raw_${e.source}_${S.seed}_${stamp}.txt`;
-      downloadTextFile(filename, e.cached.rawText);
-      log('raw-cdx-export', `Exported raw ${e.source} CDX for ${S.seed}`, { seed: S.seed, source: e.source, filename, cdxUrl: e.cached.cdxUrl || buildCdxUrl(S.seed, e.source), rawChars: e.cached.rawText.length });
+      downloadTextFile(filename, e.rawExportText);
+      log('raw-cdx-export', `Exported ${e.source} CDX text for ${S.seed}${e.cached && e.cached.rawTextSkipped ? ' from parsed rawLine rows' : ''}`, { seed: S.seed, source: e.source, filename, cdxUrl: e.cached.cdxUrl || buildCdxUrl(S.seed, e.source), rawChars: e.rawExportText.length, rawTextSkipped: !!(e.cached && e.cached.rawTextSkipped) });
       return;
     }
-    const text = found.map(e => `===== ${e.source.toUpperCase()} CDX ${S.seed} =====\n${e.cached.rawText}`).join('\n\n');
+    const text = found.map(e => `===== ${e.source.toUpperCase()} CDX ${S.seed} =====\n${e.rawExportText}`).join('\n\n');
     const filename = `cdx_raw_both_${S.seed}_${stamp}.txt`;
     downloadTextFile(filename, text);
-    log('raw-cdx-export', `Exported raw desktop+mobile CDX for ${S.seed}`, { seed: S.seed, filename, sources: found.map(e => e.source), rawChars: text.length });
+    log('raw-cdx-export', `Exported desktop+mobile CDX text for ${S.seed}`, { seed: S.seed, filename, sources: found.map(e => e.source), rawChars: text.length });
   }
 
-  function clearCache(kind) {
+  function seedScopedRowsForCacheClear() {
+    const rows = [];
+    const seen = new Set();
+    const addRows = list => {
+      for (const row of list || []) {
+        if (!row || !row.timestamp) continue;
+        const k = `${row.source || row.cdxSource || 'desktop'}:${row.timestamp}:${row.digest || row.original || ''}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        rows.push(row);
+      }
+    };
+    addRows(S.cdxRows);
+    addRows(S.selectedRows);
+    for (const source of ['desktop', 'mobile']) {
+      const cached = getStore(`cdx:${source}:${S.seed}`, null);
+      if (cached && Array.isArray(cached.rows)) addRows(cached.rows.map(r => Object.assign({}, r, { source: r.source || source })));
+    }
+    return rows;
+  }
+
+  async function clearCurrentSeedCache() {
+    if (!S.seed) return 0;
+    S.scanNonce++;
+    S.rangeTaskToken++;
+    S.thumbTaskToken++;
+    cancel2oeQueue('clear seed cache');
+    S.stopped = true;
+    S.paused = false;
+    const rows = seedScopedRowsForCacheClear();
+    const keys = new Set([
+      `cdx:desktop:${S.seed}`,
+      `cdx:mobile:${S.seed}`
+    ]);
+    for (const row of rows) {
+      keys.add(snapshotHtmlCacheKey(row));
+      keys.add(parsedCacheKey(row));
+      keys.add(parsedCacheKey(Object.assign({}, row, { _discarded: true })));
+    }
+    const activeIds = new Set();
+    const collectIdsFromCapture = cap => {
+      for (const item of ((cap && cap.items) || [])) {
+        if (item && item.id) activeIds.add(item.id);
+      }
+    };
+    for (const cap of S.parsedCaptures || []) collectIdsFromCapture(cap);
+    for (const row of rows) {
+      collectIdsFromCapture(getStore(parsedCacheKey(row), null));
+      collectIdsFromCapture(getStore(parsedCacheKey(Object.assign({}, row, { _discarded: true })), null));
+    }
+    for (const id of activeIds) {
+      keys.add(thumbStateCacheKey(id));
+      keys.add(status2oeCacheKey(id));
+      keys.add(cdxThumbCacheKey(id));
+      keys.add('thumb:' + makeDirectThumb(id));
+    }
+    let deleted = 0;
+    for (const k of keys) {
+      const full = key(k);
+      try {
+        if (GM_listValues().includes(full)) deleted++;
+        GM_deleteValue(full);
+      } catch (_) {}
+      if (k.startsWith('snapshothtml:') && await idbDelete(k)) deleted++;
+    }
+    delStore(badCapturesKey());
+    delStore(resolvedTriageKey());
+    resetResults();
+    S.cdxRows = [];
+    S.selectedRows = [];
+    S.discarded = [];
+    S.badCaptures = [];
+    renderAll();
+    return deleted;
+  }
+
+  async function clearCache(kind) {
+    const label = kind === 'all' ? 'Clear All WYSC Data' : `Clear ${kind} cache`;
+    log('cache-clear', `${label} requested`, { kind, paused: !!S.paused, running: !!S.running, seed: S.seed || '' });
     const all = GM_listValues().filter(k => k.startsWith(APP.storagePrefix));
-    const del = (pred) => all.forEach(k => { const short = k.slice(APP.storagePrefix.length); if (pred(short)) GM_deleteValue(k); });
-    if (kind === 'seed') del(k => k.includes(S.seed));
-    else if (kind === 'cdx') del(k => k.startsWith('cdx:'));
-    else if (kind === 'thumb') del(k => k.startsWith('thumb:'));
-    else if (kind === 'parsed') del(k => k.startsWith('parsed:') || k.startsWith('discardedparsed:'));
-    else if (kind === 'html') del(k => k.startsWith('snapshothtml:'));
-    else if (kind === 'history') del(k => k === 'seedHistory');
-    else if (kind === 'all') del(() => true);
-    log('cache-clear', `Cleared ${kind}`);
+    const del = (pred) => {
+      let deleted = 0;
+      all.forEach(k => {
+        const short = k.slice(APP.storagePrefix.length);
+        if (pred(short)) { try { GM_deleteValue(k); deleted++; } catch (_) {} }
+      });
+      return deleted;
+    };
+    let deleted = 0;
+    let idbDeleted = 0;
+    if (kind === 'seed') {
+      deleted = await clearCurrentSeedCache();
+      log('cache-clear', `Cleared this seed cache`, { seed: S.seed, deletedKeys: deleted });
+      return;
+    }
+    else if (kind === 'cdx') deleted = del(k => k.startsWith('cdx:'));
+    else if (kind === 'thumb') deleted = del(k => k.startsWith('thumb:') || k.startsWith('thumbstate:') || k.startsWith('cdxthumb:'));
+    else if (kind === 'parsed') deleted = del(k => k.startsWith('parsed:') || k.startsWith('discardedparsed:'));
+    else if (kind === 'html') { deleted = del(k => k.startsWith('snapshothtml:')); idbDeleted = await idbClearByPrefix('snapshothtml:'); }
+    else if (kind === 'history') deleted = del(k => k === 'seedHistory');
+    else if (kind === 'all') { deleted = del(() => true); idbDeleted = await idbClearByPrefix(''); }
+    log('cache-clear', `Cleared ${kind}`, { kind, gmDeleted: deleted, idbDeleted, paused: !!S.paused, running: !!S.running });
+    if (kind === 'all') {
+      syncVisibleRangeControls();
+      renderToggles();
+      renderStats();
+      applyButtonTooltips();
+      log('cache-clear', `Clear All WYSC Data reset visible range controls to default ${rangeLabel(settings())}`, { range: normalizeRangeSettings(settings()), mode: settings().mode });
+    }
     if (kind === 'history') renderHistory();
   }
 
@@ -5485,6 +8217,66 @@ async function copyBadCaptureUrls() {
     `;
   }
 
+  const BUTTON_TOOLTIPS = {
+    seedHistoryMenuBtn: 'Show recent starting videos saved in this browser.',
+    applySeedBtn: 'Load WYSC for the video ID or YouTube URL in the Starting video field.',
+    useCurrentSeedBtn: 'Use the current YouTube watch page video ID as the starting video.',
+    clearSeedHistoryBtn: 'Clear the recent starting-video history list.',
+    themeBtn: 'Toggle dark/light WYSC theme.',
+    dedupeBtn: 'Show or hide duplicate suggestions after their first occurrence.',
+    fallbackThumbBtn: 'Auto-check archived page/timestamp thumbnails for unavailable videos. Turn this ON before Auto CDX for best priority.',
+    jumpThumbQueueBtn: 'Jump to the next video card that is waiting for or running thumbnail fallback checks.',
+    autoCdxThumbBtn: 'Auto-query Wayback CDX for archived i.ytimg.com thumbnails. Best used after Auto fallback thumbnails is already ON.',
+    triageOnlyBtn: 'Show only incomplete/problem captures and skip normal missing-capture scanning while enabled.',
+    discardedScanBtn: 'Include selected discarded CDX rows in the scan when possible.',
+    auto2oeBtn: 'Automatically check 2oe archived playback availability for found videos.',
+    copyDiscardedReportBtn: 'Copy a report of discarded CDX rows to the clipboard.',
+    pauseBtn: 'Pause queued work after the current in-flight request finishes.',
+    stopBtn: 'Stop queued work after the current in-flight request finishes.',
+    reloadBtn: 'Reset current results, reparse cached HTML first, then scan missing selected captures.',
+    debugBtn: 'Copy current WYSC state/debug JSON to the clipboard.',
+    captureOrderAuditBtn: 'Copy a capture slot/order audit report to the clipboard.',
+    copyAllParseDebugBtn: 'Copy parser debug data for all parsed video cards.',
+    copyMissingParseDebugBtn: 'Copy parser debug data only for incomplete/missing parse cases.',
+    copyBadCapturesBtn: 'Copy the current Needs review capture list.',
+    copyBadHtmlBtn: 'Copy cached raw HTML for bad/needs-review captures when available.',
+    copyRepBadHtmlBtn: 'Copy representative cached HTML examples for triage groups.',
+    clearBadCapturesBtn: 'Clear the in-memory/stored Needs review capture list.',
+    copyLogsBtn: 'Copy visible WYSC logs to the clipboard.',
+    clearLogsBtn: 'Clear the visible WYSC log panel.',
+    rawCdxBtn: 'Export the current raw/compact CDX rows.',
+    exportFetchedHtmlBtn: 'Export cached Need Reviews HTML entries.',
+    retryFailedBtn: 'Retry selected failed HTTP snapshot pages.',
+    reparseHtmlBtn: 'Reparse currently cached raw snapshot HTML.',
+    reparseTriageBtn: 'Reparse incomplete results from cached HTML.',
+    clearResolvedBtn: 'Clear the resolved review history list.',
+    restoreResolvedBtn: 'Move resolved review captures back into Needs review.',
+    logZoomBtn: 'Open a larger log viewer.'
+  };
+  const CLEAR_BUTTON_TOOLTIPS = {
+    seed: 'Clear cached data only for the current starting video/seed.',
+    cdx: 'Clear cached CDX query results.',
+    thumb: 'Clear live/fallback/CDX thumbnail cache and thumbnail state.',
+    parsed: 'Clear cached parser/result captures.',
+    html: 'Clear cached raw snapshot HTML from GM storage and IndexedDB.',
+    history: 'Clear recent starting-video history.',
+    all: 'Clear all WYSC GM/IndexedDB data. Visible range controls reset to the default full range.'
+  };
+  function applyButtonTooltips(root) {
+    root = root || document;
+    const buttons = root.querySelectorAll ? root.querySelectorAll('button') : [];
+    for (const b of buttons) {
+      if (!b) continue;
+      let tip = b.id ? BUTTON_TOOLTIPS[b.id] : '';
+      if (!tip && b.dataset && b.dataset.clear) tip = CLEAR_BUTTON_TOOLTIPS[b.dataset.clear] || '';
+      if (!tip) {
+        const text = cleanText(b.textContent || b.getAttribute('aria-label') || 'button');
+        tip = text ? text : 'WYSC button';
+      }
+      if (!b.title || b.id !== 'useCurrentSeedBtn') b.title = tip;
+    }
+  }
+
   function appCss() { return `
     body.wytsc{margin:0;font:13px Arial, sans-serif;background:var(--bg);color:var(--fg)}
     body.wytsc.dark{--bg:#0e1117;--panel:#151a23;--soft:#202836;--fg:#e9edf5;--muted:#9ba7b8;--link:#8ab4ff;--border:#303949;--good:#2da44e;--bad:#d1242f;--warn:#bf8700}
@@ -5492,9 +8284,9 @@ async function copyBadCaptureUrls() {
     #app{min-height:100vh}
     #stickyTop{position:sticky;top:0;z-index:50;background:var(--panel);box-shadow:0 2px 10px #0003}
     header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel);margin:0} h1{display:inline;margin:0 10px 0 0;font-size:18px} #version{padding:2px 8px;border-radius:999px;font-weight:700}.dev{background:#fff3cd;color:#6b4e00}.stable{background:#dafbe1;color:#116329}.broken{background:#ffebe9;color:#82071e}
-    #seedbar,#toolbar,#cachebar{display:flex;gap:5px;align-items:center;flex-wrap:wrap;padding:4px 10px;background:var(--soft);border-bottom:1px solid var(--border);margin:0}.seedInputWrap input{min-width:230px}#seedHistoryMenu{position:fixed;z-index:2147483647;width:310px;max-height:340px;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 34px #0008;padding:6px}.seedMenuTitle{font-weight:700;margin:3px 4px 6px}.seedMenuItem,.seedMenuAction{display:block;width:100%;text-align:left;margin:2px 0}.currentSeed{border-color:var(--good)!important;background:color-mix(in srgb,var(--good) 18%,var(--panel));font-weight:700}.newBadge{font-size:10px;border:1px solid var(--good);color:var(--good);border-radius:999px;padding:0 4px}.capCount{color:var(--muted);min-width:48px}.summaryBox{padding:4px 0 6px;border-bottom:1px solid var(--border);margin-bottom:4px}.seedMenuDivider{height:1px;background:var(--border);margin:6px 0}.seedMenuEmpty{color:var(--muted);padding:6px}.customModeControls{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}#cachebar{padding-top:3px;padding-bottom:3px} input,select,button{font:inherit;font-size:12px;border:1px solid var(--border);border-radius:7px;padding:4px 7px;background:var(--panel);color:var(--fg)}#toolbar input[type=number]{width:58px} button{cursor:pointer}.flashApplied{animation:wyscFlashApplied .9s ease-out}@keyframes wyscFlashApplied{0%{outline:3px solid var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 35%,transparent)}100%{outline:0 solid transparent;box-shadow:none}}button.on{border-color:var(--good);box-shadow:inset 0 0 0 1px var(--good)}button.off{border-color:var(--bad);color:var(--muted)}
-    main{display:grid;grid-template-columns:340px 1fr;gap:12px;padding:12px 12px 140px} aside{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 10px 140px;max-height:calc(100vh - 190px);overflow:auto;position:sticky;top:168px;align-self:start;scroll-padding-bottom:140px} h2{font-size:14px;margin:12px 0 6px}.cap{padding:4px;border-bottom:1px solid var(--border)}.cap.bad{color:var(--bad)}a{color:var(--link)}#stats{padding-top:8px}#captures,#badCaptures,#resolvedCaptures{max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg)}.cap{display:flex;gap:6px;align-items:center}.cap span{flex:1}.cap.recovered span{color:var(--good)}.capRetry{padding:1px 6px;font-size:11px;border-color:var(--warn);color:var(--warn)}.badCap,.resolvedCap{padding:5px;border-bottom:1px solid var(--border)}.badCapSummary,.resolvedSummary{padding:6px;border-bottom:1px solid var(--border);background:var(--soft);font-size:11px;color:var(--muted)}.triageGroups{border-bottom:1px solid var(--border);background:var(--panel)}.triageGroupCard{padding:7px;border-bottom:1px solid var(--border);font-size:11px}.triageGroupTitle{font-weight:700;color:var(--fg);margin-bottom:4px}.triageGroupTitle span{color:var(--muted);font-weight:400}.triageGroupLine{margin:2px 0;overflow-wrap:anywhere}.badCapFlatHeader{padding:5px 6px;background:var(--soft);border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--muted)}.muted{color:var(--muted)}.triageIndex{display:inline-block;min-width:34px;color:var(--muted);font-weight:700}.triageChips{margin:3px 0}.triageChip{display:inline-block;margin:0 3px 2px 0;padding:1px 5px;border:1px solid var(--border);border-radius:999px;font-size:10px;color:var(--fg);background:var(--soft)}.triage-missing,.triage-snapshot{color:var(--bad);border-color:var(--bad)}.triage-loose,.triage-fallback,.triage-0-parsed{color:var(--warn);border-color:var(--warn)}.badReason{font-size:11px;color:var(--warn);overflow-wrap:anywhere}.resolvedReason{font-size:11px;color:var(--good);overflow-wrap:anywhere}.badJump{padding:1px 6px;font-size:11px;border-color:var(--link);color:var(--link)}.capJump{padding:1px 6px;font-size:11px;border-color:var(--link);color:var(--link)}.captureJumpHighlight{outline:2px solid #ffd54f;box-shadow:0 0 18px #ffd54f}.captureFailed .captureHead span{color:var(--bad);font-weight:700}#log{white-space:pre-wrap;max-height:240px;overflow:auto;color:var(--muted);border:1px solid var(--border);border-radius:8px;background:var(--bg);padding:6px 6px 110px;scroll-padding-bottom:110px}.logline{padding:2px 4px;border-left:3px solid transparent}.logBad{color:var(--bad);border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent)}.logWarn{color:var(--warn);border-left-color:var(--warn);background:color-mix(in srgb,var(--warn) 10%,transparent)}.logGood{color:var(--good);border-left-color:var(--good);background:color-mix(in srgb,var(--good) 10%,transparent)}.logInfo{color:var(--link);border-left-color:var(--link);background:color-mix(in srgb,var(--link) 8%,transparent)}
-    #videoList{display:block}.captureGroup{scroll-margin-top:160px;margin:0 0 18px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden}.captureHead{display:grid;grid-template-columns:max-content max-content minmax(0,1fr);gap:10px;align-items:center;padding:9px 12px;background:var(--soft);border-bottom:1px solid var(--border)}.captureHead code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.captureGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:12px}.card{display:grid;grid-template-columns:260px minmax(0,1fr);gap:12px;background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:10px;min-width:0}.card.dupeCard{opacity:.86}.thumbLink{display:block;width:260px;height:146px}.thumb{width:260px;height:146px;object-fit:cover;background:#333;border-radius:10px;cursor:pointer}.mobileSpriteThumb{background-repeat:no-repeat;image-rendering:auto;max-width:260px;max-height:146px}.meta{min-width:0;overflow-wrap:anywhere}.meta h3{font-size:15px;margin:0 0 6px;line-height:1.25}.mainMeta,.uploader{margin:3px 0;color:var(--fg)}.copyParseDebugBtn{margin:5px 0;padding:3px 7px;font-size:11px;color:var(--link);border-color:var(--border)}.debugGrid{display:grid;grid-template-columns:92px minmax(0,1fr);gap:3px 8px;margin-top:8px;font-size:12px;color:var(--muted)}.debugGrid>div{min-width:0;overflow-wrap:anywhere;word-break:break-word}.dbgGood{color:var(--good);font-weight:700}.dbgBad{color:var(--bad);font-weight:700}.dbgWarn{color:var(--warn);font-weight:700}.dbgInfo{color:var(--link)}.dbg2oeUnchecked{color:var(--muted)}.dbg2oeChecking{color:var(--link);font-weight:700}.dbg2oeGood{color:var(--good);font-weight:700}.dbg2oeWarn{color:var(--warn);font-weight:700}.dbg2oeBad{color:var(--bad);font-weight:700}.thumbDebug{margin-top:8px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:6px}.debugLine{overflow-wrap:anywhere}.badge{display:inline-block;background:var(--soft);border:1px solid var(--border);border-radius:999px;padding:1px 6px;font-size:11px}.badge.warn{background:#fff3cd;color:#6b4e00}.seed{margin:2px}.empty{padding:30px;text-align:center;color:var(--muted)}.empty.small{padding:12px;grid-column:1/-1}
+    #seedbar,#toolbar,#cachebar{display:flex;gap:5px;align-items:center;flex-wrap:wrap;padding:4px 10px;background:var(--soft);border-bottom:1px solid var(--border);margin:0}.seedInputWrap input{min-width:230px}#seedHistoryMenu{position:fixed;z-index:2147483647;width:310px;max-height:340px;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 34px #0008;padding:6px}.seedMenuTitle{font-weight:700;margin:3px 4px 6px}.seedMenuItem,.seedMenuAction{display:block;width:100%;text-align:left;margin:2px 0}.currentSeed{border-color:var(--good)!important;background:color-mix(in srgb,var(--good) 18%,var(--panel));font-weight:700}.capRetryStatus{font-size:11px;font-weight:800;white-space:nowrap}.capRetryGood{color:var(--good)}.capRetryBad{color:var(--bad)}.capCount{color:var(--muted);min-width:48px}.summaryBox{padding:4px 0 6px;border-bottom:1px solid var(--border);margin-bottom:4px}.seedMenuDivider{height:1px;background:var(--border);margin:6px 0}.seedMenuEmpty{color:var(--muted);padding:6px}.customModeControls{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}#cachebar{padding-top:3px;padding-bottom:3px} input,select,button{font:inherit;font-size:12px;border:1px solid var(--border);border-radius:7px;padding:4px 7px;background:var(--panel);color:var(--fg)}#toolbar input[type=number]{width:58px}.logTitle{display:flex;align-items:center;justify-content:space-between}.logTitle button{padding:1px 6px;font-size:14px} button{cursor:pointer}.flashApplied{animation:wyscFlashApplied .9s ease-out}@keyframes wyscFlashApplied{0%{outline:3px solid var(--good);box-shadow:0 0 0 3px color-mix(in srgb,var(--good) 35%,transparent)}100%{outline:0 solid transparent;box-shadow:none}}button.on{border-color:var(--good);box-shadow:inset 0 0 0 1px var(--good)}button.off{border-color:var(--bad);color:var(--muted)}
+    main{display:grid;grid-template-columns:340px 1fr;gap:12px;padding:12px 12px 140px} aside{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 10px 140px;max-height:calc(100vh - 190px);overflow:auto;position:sticky;top:168px;align-self:start;scroll-padding-bottom:140px} h2{font-size:14px;margin:12px 0 6px}.cap{padding:4px;border-bottom:1px solid var(--border)}.cap.bad{color:var(--bad)}.cap.pending{color:var(--muted);font-style:italic}.cap.pending .capCount{color:var(--muted)}a{color:var(--link)}#stats{padding-top:8px}#captures,#badCaptures,#resolvedCaptures{max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg)}.cap{display:flex;gap:6px;align-items:center}.cap span{flex:1}.capRetry{padding:1px 6px;font-size:11px;border-color:var(--warn);color:var(--warn)}.badCap,.resolvedCap{padding:5px;border-bottom:1px solid var(--border)}.badCapSummary,.resolvedSummary{padding:6px;border-bottom:1px solid var(--border);background:var(--soft);font-size:11px;color:var(--muted)}.triageGroups{border-bottom:1px solid var(--border);background:var(--panel)}.triageGroupCard{padding:7px;border-bottom:1px solid var(--border);font-size:11px}.triageGroupTitle{font-weight:700;color:var(--fg);margin-bottom:4px}.triageGroupTitle span{color:var(--muted);font-weight:400}.triageGroupLine{margin:2px 0;overflow-wrap:anywhere}.badCapFlatHeader{padding:5px 6px;background:var(--soft);border-bottom:1px solid var(--border);font-size:11px;font-weight:700;color:var(--muted)}.muted{color:var(--muted)}.triageIndex{display:inline-block;min-width:34px;color:var(--muted);font-weight:700}.triageChips{margin:3px 0}.triageChip{display:inline-block;margin:0 3px 2px 0;padding:1px 5px;border:1px solid var(--border);border-radius:999px;font-size:10px;color:var(--fg);background:var(--soft)}.triage-missing,.triage-snapshot{color:var(--bad);border-color:var(--bad)}.triage-loose,.triage-fallback,.triage-0-parsed{color:var(--warn);border-color:var(--warn)}.badReason{font-size:11px;color:var(--warn);overflow-wrap:anywhere}.resolvedReason{font-size:11px;color:var(--good);overflow-wrap:anywhere}.badJump{padding:1px 6px;font-size:11px;border-color:var(--link);color:var(--link)}.capJump{width:42px;min-width:42px;max-width:42px;height:22px;line-height:14px;padding:1px 4px;font-size:11px;white-space:nowrap;border-color:var(--link);color:var(--link)}.captureJumpHighlight{outline:2px solid #ffd54f;box-shadow:0 0 18px #ffd54f}.captureFailed .captureHead span{color:var(--bad);font-weight:700}.captureRetryQueued{border-color:var(--warn);box-shadow:0 0 0 1px color-mix(in srgb,var(--warn) 40%,transparent)}.captureRetryQueued .captureHead{background:color-mix(in srgb,var(--warn) 16%,var(--soft))}.captureRetryQueued .captureHead span{color:var(--warn);font-weight:800}#log{white-space:pre-wrap;max-height:240px;overflow:auto;color:var(--muted);border:1px solid var(--border);border-radius:8px;background:var(--bg);padding:6px 6px 110px;scroll-padding-bottom:110px}.logline{padding:2px 4px;border-left:3px solid transparent}.logBad{color:var(--bad);border-left-color:var(--bad);background:color-mix(in srgb,var(--bad) 10%,transparent)}.logWarn{color:var(--warn);border-left-color:var(--warn);background:color-mix(in srgb,var(--warn) 10%,transparent)}.logGood{color:var(--good);border-left-color:var(--good);background:color-mix(in srgb,var(--good) 10%,transparent)}.logInfo{color:var(--link);border-left-color:var(--link);background:color-mix(in srgb,var(--link) 8%,transparent)}#logZoomOverlay{position:fixed;inset:0;z-index:2147483647;background:#0008;display:flex;align-items:center;justify-content:center}#logZoomBox{width:min(1100px,94vw);height:min(760px,88vh);background:var(--panel);color:var(--fg);border:1px solid var(--border);border-radius:12px;box-shadow:0 18px 60px #000c;display:flex;flex-direction:column;overflow:hidden}#logZoomHead{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:var(--soft);border-bottom:1px solid var(--border)}#logZoomBody{flex:1;overflow:auto;white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;padding:8px;background:var(--bg)}
+    #videoList{display:block;min-width:0}.captureGroup{scroll-margin-top:160px;margin:0 0 18px;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;min-width:0}.captureHead{display:grid;grid-template-columns:max-content max-content max-content minmax(0,1fr);gap:10px;align-items:center;padding:9px 12px;background:var(--soft);border-bottom:1px solid var(--border);min-width:0}.captureHead code{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}.copyFetchedHtmlBtn{white-space:nowrap;justify-self:start}.captureGrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:12px}.card{display:grid;grid-template-columns:260px minmax(0,1fr);gap:12px;background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:10px;min-width:0}.card.dupeCard{opacity:.86}.thumbLink{display:block;width:260px;height:146px}.thumb{width:260px;height:146px;object-fit:cover;background:#333;border-radius:10px;cursor:pointer}.mobileSpriteThumb{background-repeat:no-repeat;image-rendering:auto;max-width:260px;max-height:146px}.meta{min-width:0;overflow-wrap:anywhere}.meta h3{font-size:15px;margin:0 0 6px;line-height:1.25}.mainMeta,.uploader{margin:3px 0;color:var(--fg)}.copyParseDebugBtn{margin:5px 0;padding:3px 7px;font-size:11px;color:var(--link);border-color:var(--border)}.debugGrid{display:grid;grid-template-columns:92px minmax(0,1fr);gap:3px 8px;margin-top:8px;font-size:12px;color:var(--muted)}.debugGrid>div{min-width:0;overflow-wrap:anywhere;word-break:break-word}.dbgGood{color:var(--good);font-weight:700}.dbgBad{color:var(--bad);font-weight:700}.dbgWarn{color:var(--warn);font-weight:700}.dbgInfo{color:var(--link)}.dbg2oeUnchecked{color:var(--muted)}.dbg2oeChecking{color:var(--link);font-weight:700}.dbg2oeGood{color:var(--good);font-weight:700}.dbg2oeWarn{color:var(--warn);font-weight:700}.dbg2oeBad{color:var(--bad);font-weight:700}.thumbQueueItem{outline:1px solid var(--warn)}.thumbQueueHighlight{animation:thumbQueueFlash 2s ease-out 1}@keyframes thumbQueueFlash{0%{box-shadow:0 0 0 4px rgba(255,193,7,.9)}100%{box-shadow:0 0 0 0 rgba(255,193,7,0)}}.badge{display:inline-block;background:var(--soft);border:1px solid var(--border);border-radius:999px;padding:1px 6px;font-size:11px}.badge.warn{background:#fff3cd;color:#6b4e00}.seed{margin:2px}.empty{padding:30px;text-align:center;color:var(--muted)}.empty.small{padding:12px;grid-column:1/-1}
     @media(max-width:1200px){main{grid-template-columns:1fr}aside{position:relative;top:0;max-height:none}.captureGrid{grid-template-columns:1fr}.captureHead{}.card{grid-template-columns:220px 1fr}.thumbLink{width:220px;height:124px}.thumb{width:220px;height:124px}}
 
     #seedbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;border-top:1px solid var(--border);background:var(--panel)}
